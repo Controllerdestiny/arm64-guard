@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define TRAMP_PAGE 4096
 #define MAX_RECS   64
@@ -43,12 +44,17 @@ typedef struct {
     uint8_t *tramp;
     size_t tsz;
     int used;
+    /* 外部回跳补丁区的分支重映射(卸载时需恢复原指令) */
+    uint64_t fix_addr[INSTR_FIX_MAX];
+    uint32_t fix_orig[INSTR_FIX_MAX];
+    int fix_count;
 } rec_t;
 
 static rec_t g_recs[MAX_RECS];
 
 static int patch_register(uint64_t addr, const uint8_t *orig, int len,
-                          uint8_t *tramp, size_t tsz) {
+                          uint8_t *tramp, size_t tsz,
+                          const instr_fix_t *fixes, int fix_count) {
     for (int i = 0; i < MAX_RECS; i++) {
         if (!g_recs[i].used) {
             g_recs[i].addr = addr;
@@ -57,6 +63,12 @@ static int patch_register(uint64_t addr, const uint8_t *orig, int len,
             g_recs[i].tramp = tramp;
             g_recs[i].tsz = tsz;
             g_recs[i].used = 1;
+            g_recs[i].fix_count = fix_count < INSTR_FIX_MAX ? fix_count
+                                                            : INSTR_FIX_MAX;
+            for (int j = 0; j < g_recs[i].fix_count; j++) {
+                g_recs[i].fix_addr[j] = fixes[j].addr;
+                g_recs[i].fix_orig[j] = fixes[j].orig_insn;
+            }
             return INSTR_OK;
         }
     }
@@ -83,8 +95,14 @@ static int apply_bytes(void *addr, const uint8_t *bytes, size_t len) {
     return INSTR_OK;
 }
 
+/*
+ * 安全取指:先做边界检查再 memcpy,杜绝读未映射内存导致 SIGSEGV。
+ * 边界由 elf64_module_init 通过 PT_LOAD 推导(size>0);地址 < base 一律拒绝。
+ */
 static uint32_t fetch_runtime(void *ctx, uint64_t addr) {
     const elf64_module_t *m = (const elf64_module_t *)ctx;
+    if (!m->base || addr < (uint64_t)(uintptr_t)m->base)
+        return 0;
     ptrdiff_t off = elf64_va_to_offset(m, addr);
     if (off < 0)
         return 0;
@@ -94,6 +112,30 @@ static uint32_t fetch_runtime(void *ctx, uint64_t addr) {
     uint32_t w;
     memcpy(&w, img + off, 4);
     return w;
+}
+
+/*
+ * 无符号大小:扫到最后一个 ret(上限 1M 条指令 = 4MB,支持很大的函数)。
+ * 遇到连续 0 字(数据/对齐填充)继续跳过,而非直接 break —— 巨型函数内
+ * 偶发的 0 字(如跳转表)不应截断函数末尾扫描。
+ */
+static uint64_t scan_fn_end(const elf64_module_t *m, uint64_t va) {
+    uint64_t last = va + 4;
+    int zeros = 0;
+    for (uint64_t pc = va; pc < va + (1u << 20) * 4; pc += 4) {
+        uint32_t w = fetch_runtime((void *)m, pc);
+        if (!w) {
+            if (++zeros >= 64)   /* 连续 64 字(256B)为 0,视为到达函数末尾 */
+                break;
+            continue;
+        }
+        zeros = 0;
+        a64_insn_t d;
+        a64_decode(pc, w, &d);
+        if (d.kind == A64_RET)
+            last = pc + 4;
+    }
+    return last;
 }
 
 /* ---------------- 规划并应用一次守卫 ---------------- */
@@ -132,30 +174,45 @@ static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
     memcpy(tramp, plan.tramp, tsz);
     __builtin___clear_cache((char *)tramp, (char *)tramp + (long)tsz);
 
+    if (getenv("INSTR_DEBUG")) {
+        fprintf(stderr,
+                "[instr] guard=%p cstart=%p cend=%p plen=%d fix_count=%d "
+                "tramp_words=%zu\n",
+                (void *)(uintptr_t)guard, (void *)(uintptr_t)cstart,
+                (void *)(uintptr_t)cend, plan.patch_len, plan.fix_count,
+                plan.tramp_words);
+        for (int i = 0; i < plan.fix_count; i++)
+            fprintf(stderr, "[instr]   fix[%d] @%p: 0x%08x -> 0x%08x\n", i,
+                    (void *)(uintptr_t)plan.fixes[i].addr,
+                    plan.fixes[i].orig_insn, plan.fixes[i].new_insn);
+    }
+
     rc = apply_bytes((void *)(uintptr_t)guard, plan.patch, plan.patch_len);
     if (rc != INSTR_OK) {
         munmap(tramp, TRAMP_PAGE);
         return rc;
     }
-    return patch_register(guard, plan.orig, plan.patch_len, tramp, TRAMP_PAGE);
+
+    /* 外部回跳补丁区的分支:逐个改写目标到 trampoline 对应位置 */
+    for (int i = 0; i < plan.fix_count; i++) {
+        rc = apply_bytes((void *)(uintptr_t)plan.fixes[i].addr,
+                         (const uint8_t *)&plan.fixes[i].new_insn, 4);
+        if (rc != INSTR_OK) {
+            /* 回滚已应用的 fix(用原指令),恢复主补丁,释放 trampoline */
+            for (int j = 0; j < i; j++) {
+                apply_bytes((void *)(uintptr_t)plan.fixes[j].addr,
+                            (const uint8_t *)&plan.fixes[j].orig_insn, 4);
+            }
+            apply_bytes((void *)(uintptr_t)guard, plan.orig, plan.patch_len);
+            munmap(tramp, TRAMP_PAGE);
+            return rc;
+        }
+    }
+    return patch_register(guard, plan.orig, plan.patch_len, tramp, TRAMP_PAGE,
+                          plan.fixes, plan.fix_count);
 }
 
 /* ---------------- 公共 API ---------------- */
-
-/* 无符号大小:扫到最后一个 ret(上限 1M 条指令 = 4MB,支持很大的函数) */
-static uint64_t scan_fn_end(const elf64_module_t *m, uint64_t va) {
-    uint64_t last = va + 4;
-    for (uint64_t pc = va; pc < va + (1u << 20) * 4; pc += 4) {
-        uint32_t w = fetch_runtime((void *)m, pc);
-        if (!w)
-            break;
-        a64_insn_t d;
-        a64_decode(pc, w, &d);
-        if (d.kind == A64_RET)
-            last = pc + 4;
-    }
-    return last;
-}
 
 int instr_guard_block(void *fn, void *block_start, void *block_end,
                       void *check) {
@@ -175,9 +232,19 @@ int instr_guard_block(void *fn, void *block_start, void *block_end,
         return INSTR_ERR_NOT_ELF;
     }
     uint64_t cstart = (uint64_t)(uintptr_t)fn;
+    uint64_t bstart = (uint64_t)(uintptr_t)block_start;
+    uint64_t bend = (uint64_t)(uintptr_t)block_end;
+
+    /* 参数合法性:入口/块首/块尾都必须在模块映射范围内 */
+    if (bstart < cstart || bstart >= (uint64_t)(uintptr_t)m.base + m.size ||
+        bend <= bstart || bend > (uint64_t)(uintptr_t)m.base + m.size) {
+        set_err("block [%p, %p) out of module range base=%p size=0x%zx",
+                block_start, block_end, (void *)m.base, m.size);
+        return INSTR_ERR_RANGE;
+    }
+
     uint64_t cend = scan_fn_end(&m, cstart); /* 支持很大的函数 */
-    return apply_plan(&m, cstart, cend, (uint64_t)(uintptr_t)block_start, 0,
-                      (uint64_t)(uintptr_t)block_end,
+    return apply_plan(&m, cstart, cend, bstart, 0, bend,
                       (uint64_t)(uintptr_t)check, 0);
 }
 
@@ -185,6 +252,13 @@ int instr_unpatch(void *patched_addr) {
     uint64_t a = (uint64_t)(uintptr_t)patched_addr;
     for (int i = 0; i < MAX_RECS; i++) {
         if (g_recs[i].used && g_recs[i].addr == a) {
+            /* 先恢复外部回跳分支的重映射(原指令已保存) */
+            for (int j = 0; j < g_recs[i].fix_count; j++) {
+                int rc = apply_bytes((void *)(uintptr_t)g_recs[i].fix_addr[j],
+                                     (const uint8_t *)&g_recs[i].fix_orig[j], 4);
+                if (rc != INSTR_OK)
+                    return rc;
+            }
             int rc = apply_bytes((void *)(uintptr_t)a, g_recs[i].orig,
                                  (size_t)g_recs[i].len);
             if (rc != INSTR_OK)

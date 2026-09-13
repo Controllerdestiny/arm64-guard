@@ -43,6 +43,17 @@ typedef struct {
 } elf64_shdr_t;
 
 typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} elf64_phdr_t;
+
+typedef struct {
     uint32_t st_name;
     unsigned char st_info;
     unsigned char st_other;
@@ -70,6 +81,7 @@ typedef struct {
 /* 常用常量 */
 #define EM_AARCH64        183
 #define ET_DYN            3
+#define PT_LOAD           1
 #define SHT_NULL          0
 #define SHT_PROGBITS      1
 #define SHT_SYMTAB        2

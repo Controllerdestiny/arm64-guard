@@ -61,28 +61,105 @@ static int em_put_displaced(em_t *e, uint64_t old_pc, uint32_t insn) {
         em_put(e, out);
         return 0;
     }
-    if (r == -1) {
-        /* b/bl 超范围:绝对装载 + 间接跳转 */
-        a64_insn_t d;
-        a64_decode(old_pc, insn, &d);
-        if (d.kind == A64_BL) {
-            em_put_lit(e, 16, d.target);
-            em_put(e, a64_insn_blr(16));
-            return 0;
-        }
-        if (d.kind == A64_B) {
-            em_put_lit(e, 16, d.target);
-            em_put(e, a64_insn_br(16));
-            return 0;
-        }
+    a64_insn_t d;
+    a64_decode(old_pc, insn, &d);
+    switch (d.kind) {
+    case A64_BL:
+        /* bl 超范围:绝对装载 + 间接调用 */
+        em_put_lit(e, 16, d.target);
+        em_put(e, a64_insn_blr(16));
+        return 0;
+    case A64_B:
+        /* b 超范围:绝对装载 + 间接跳转 */
+        em_put_lit(e, 16, d.target);
+        em_put(e, a64_insn_br(16));
+        return 0;
+    case A64_LDR_LIT:
+        /* ldr xN, label 超范围(±1MB):先绝对装载 label 地址,再间接取内存 */
+        em_put_lit(e, 16, d.target);
+        em_put(e, a64_insn_ldr_imm(d.rt, 16, 0, d.is64));
+        return 0;
+    case A64_ADRP:
+        /* adrp xN, page 超范围(±4GB):绝对装载页地址 */
+        em_put_lit(e, 16, d.page);
+        em_put(e, a64_insn_mov_reg(d.rd, 16, 1));
+        return 0;
+    case A64_ADR:
+        /* adr xN, target 超范围(±1MB):绝对装载地址 */
+        em_put_lit(e, 16, d.target);
+        em_put(e, a64_insn_mov_reg(d.rd, 16, 1));
+        return 0;
+    case A64_B_COND:
+        /* b.cond target 超范围(±1MB):条件不满足 → 跳过绝对跳;满足 → 绝对跳 */
+        em_put(e, a64_insn_b_cond(em_here(e) + 6 * 4, em_here(e),
+                                  (int)(insn & 15) ^ 1));
+        em_put_lit(e, 16, d.target);
+        em_put(e, a64_insn_br(16));
+        return 0;
+    case A64_CBZ: {
+        int cbnz = ((insn & 0x7E000000) == 0x35000000 ||
+                    (insn & 0x7E000000) == 0xB5000000);
+        /* cbz rt,target:rt==0 跳。反转:cbnz rt,skip;绝对跳 target;skip: 继续 */
+        em_put(e, cbnz ? a64_insn_cbz(d.rt, d.is64, em_here(e) + 6 * 4, em_here(e))
+                       : a64_insn_cbnz(d.rt, d.is64, em_here(e) + 6 * 4, em_here(e)));
+        em_put_lit(e, 16, d.target);
+        em_put(e, a64_insn_br(16));
+        return 0;
     }
-    return INSTR_ERR_RELOC;
+    case A64_TBZ: {
+        int tbnz = ((insn & 0x7E000000) == 0x37000000 ||
+                    (insn & 0x7E000000) == 0xB7000000);
+        /* tbz/tbnz rt,#bit,target 超范围(±32KB):反转条件跳到 skip(继续执行),
+         * 条件满足时落入绝对跳转序列跳 target。
+         * 原 tbz(位==0 跳)→ skip 用 tbnz;原 tbnz(位==1 跳)→ skip 用 tbz。 */
+        uint32_t skip = a64_insn_tbz(d.rt, (int)d.imm, d.is64,
+                                     em_here(e) + 6 * 4, em_here(e));
+        if (!tbnz)
+            skip ^= 0x01000000u; /* tbz <-> tbnz 互转 */
+        em_put(e, skip);
+        em_put_lit(e, 16, d.target);
+        em_put(e, a64_insn_br(16));
+        return 0;
+    }
+    default:
+        return INSTR_ERR_RELOC;
+    }
+}
+
+/*
+ * 被搬移指令重定位后的实际字数,与 em_put_displaced 的发射完全一致:
+ *   非 PC 相对 / 可重定位:1 字;
+ *   超范围绝对化:B/BL/LDR_LIT/ADRP/ADR = 5 字,B_COND/CBZ/TBZ = 6 字。
+ */
+static int displaced_word_count(uint64_t old_pc, uint32_t insn, uint64_t new_pc) {
+    uint32_t out;
+    int r = a64_relocate_displaced(old_pc, insn, new_pc, &out);
+    if (r == 0 || r == 1)
+        return 1;
+    a64_insn_t d;
+    a64_decode(old_pc, insn, &d);
+    switch (d.kind) {
+    case A64_B:
+    case A64_BL:
+    case A64_LDR_LIT:
+    case A64_ADRP:
+    case A64_ADR:
+        return 5;
+    case A64_B_COND:
+    case A64_CBZ:
+    case A64_TBZ:
+        return 6;
+    default:
+        return 1;
+    }
 }
 
 /* ---------------- 模块取指 ---------------- */
 
 static uint32_t fetch_module(void *ctx, uint64_t addr) {
     const elf64_module_t *m = (const elf64_module_t *)ctx;
+    if (!m->base || addr < (uint64_t)(uintptr_t)m->base)
+        return 0;
     ptrdiff_t off = elf64_va_to_offset(m, addr);
     if (off < 0)
         return 0;
@@ -109,9 +186,10 @@ typedef struct {
 
 static int plan_displaced(em_t *e, const elf64_module_t *m,
                           const uint32_t *insns, const uint64_t *pcs, int n,
-                          uint64_t guard_pc, int plen) {
+                          uint64_t guard_pc, int plen, instr_plan_t *out) {
     disp_t dlist[4];
     size_t off = e->n; /* 搬移段从当前位置开始,不是 0 */
+    out->disp_count = 0;
     for (int i = 0; i < n; i++) {
         dlist[i].pc = pcs[i];
         dlist[i].insn = insns[i];
@@ -123,11 +201,17 @@ static int plan_displaced(em_t *e, const elf64_module_t *m,
         if (internal) {
             off += 1;
         } else {
-            uint32_t out;
-            int r = a64_relocate_displaced(pcs[i], insns[i],
-                                           e->base + off * 4, &out);
-            off += (r == -1) ? 4 : 1;
+            /* 尺寸必须与实际发射(em_put_displaced)完全一致 */
+            off += (size_t)displaced_word_count(pcs[i], insns[i],
+                                                e->base + off * 4);
         }
+    }
+    /* 记录 原地址 -> trampoline 新地址 映射(供外部回跳精确重映射) */
+    out->disp_count = 0;
+    for (int i = 0; i < n && i < 8; i++) {
+        out->disp[out->disp_count].old_pc = dlist[i].pc;
+        out->disp[out->disp_count].new_addr = dlist[i].new_addr;
+        out->disp_count++;
     }
     for (int i = 0; i < n; i++) {
         a64_insn_t d;
@@ -156,6 +240,111 @@ static int plan_displaced(em_t *e, const elf64_module_t *m,
         }
     }
     return 0;
+}
+
+/*
+ * 扫描目标"落在补丁区 [guard, guard+plen)"的分支指令(B/B.cond/CBZ/CBNZ/
+ * TBZ/TBNZ),把它们的目标改写到 guard_pc。这些分支可能来自块内其他位置,
+ * 也可能是 block 之后的循环回跳,若不处理会跳进被改写的补丁字节 → 崩溃。
+ *
+ * 注意:扫描范围不能只到 caller_end。巨型函数(如 Player.Update)常被
+ * scan_fn_end 在对齐 ZERO 处截断,循环回跳点(可能在 block_end 之后几
+ * KB)会漏掉。因此额外扫到 block_end + 64KB(回跳通常不会更远)。
+ *
+ * 重映射语义:跳进补丁起点 → 执行补丁跳转 → trampoline 重新走 check:
+ * pass 则重放块首指令继续(与原始循环语义一致),skip 则跳块尾。
+ * guard_pc 与回跳点同函数内,距离恒在 ±1MB 内,单条指令必可编码。
+ *
+ * 返回值:0 成功。
+ */
+static int collect_external_fixups(const elf64_module_t *m,
+                                   uint64_t caller_start, uint64_t caller_end,
+                                   uint64_t block_end,
+                                   uint64_t guard_pc, int plen,
+                                   instr_plan_t *out) {
+    /*
+     * 扫描上界:至少覆盖到 block_end 之后 64KB(巨型函数循环回跳可能越过
+     * scan_fn_end 的截断点);以模块 size(base+RVA 上界)为硬上限,防止
+     * 越界;同时不超 1M 条指令上限,避免扫进后续函数过多。
+     */
+    uint64_t base_end = (uint64_t)(uintptr_t)m->base;
+    if (m->size)
+        base_end += m->size;
+    uint64_t scan_end = caller_end;
+    uint64_t ext = block_end > 0 ? block_end + 0x10000ULL : caller_end;
+    if (ext > scan_end)
+        scan_end = ext;
+    if (base_end > 0 && scan_end > base_end)
+        scan_end = base_end;
+    {
+        uint64_t cap = caller_start + (uint64_t)(1u << 20) * 4;
+        if (scan_end > cap)
+            scan_end = cap;
+    }
+
+    for (uint64_t pc = caller_start; pc + 4 <= scan_end; pc += 4) {
+        /* 补丁区本身会被整体改写,跳过 */
+        if (pc >= guard_pc && pc < guard_pc + (uint64_t)plen)
+            continue;
+        uint32_t insn = fetch_module((void *)m, pc);
+        a64_insn_t d;
+        a64_decode(pc, insn, &d);
+
+        uint64_t target = 0;
+        int is_branch = 0;
+        switch (d.kind) {
+        case A64_B:
+        case A64_B_COND:
+        case A64_CBZ:
+        case A64_TBZ:
+            target = d.target;
+            is_branch = 1;
+            break;
+        default:
+            break;
+        }
+        if (!is_branch)
+            continue;
+        if (target < guard_pc || target >= guard_pc + (uint64_t)plen)
+            continue;
+
+        uint32_t new_insn = 0;
+        switch (d.kind) {
+        case A64_B:
+            new_insn = a64_insn_b(guard_pc, pc);
+            break;
+        case A64_B_COND:
+            new_insn = a64_insn_b_cond(guard_pc, pc, (int)(insn & 15));
+            break;
+        case A64_CBZ: {
+            int cbnz = ((insn & 0x7E000000) == 0x35000000 ||
+                        (insn & 0x7E000000) == 0xB5000000);
+            new_insn = cbnz ? a64_insn_cbnz(d.rt, d.is64, guard_pc, pc)
+                            : a64_insn_cbz(d.rt, d.is64, guard_pc, pc);
+            break;
+        }
+        case A64_TBZ: {
+            int tbnz = ((insn & 0x7E000000) == 0x37000000 ||
+                        (insn & 0x7E000000) == 0xB7000000);
+            new_insn = a64_insn_tbz(d.rt, (int)d.imm, d.is64, guard_pc, pc);
+            if (tbnz)
+                new_insn ^= 0x01000000u;
+            break;
+        }
+        default:
+            break;
+        }
+        if (!new_insn)
+            return INSTR_ERR_RELOC; /* 距离超范围,无法单指令重映射 */
+
+        if (out->fix_count >= INSTR_FIX_MAX)
+            return INSTR_ERR_RELOC; /* 回跳点过多,不支持 */
+        out->fixes[out->fix_count].addr = pc;
+        out->fixes[out->fix_count].orig_insn = insn;
+        out->fixes[out->fix_count].new_insn = new_insn;
+        out->fix_count++;
+    }
+    return INSTR_OK;
 }
 
 /* ---------------- 保存/恢复序列 ---------------- */
@@ -347,7 +536,7 @@ int instr_plan_guard(const elf64_module_t *m,
                 insns[n] = fetch_module((void *)m, guard_pc + (uint64_t)k);
                 n++;
             }
-            int r = plan_displaced(&e, m, insns, pcs, n, guard_pc, plen);
+            int r = plan_displaced(&e, m, insns, pcs, n, guard_pc, plen, out);
             if (r)
                 return r;
         }
@@ -367,7 +556,7 @@ int instr_plan_guard(const elf64_module_t *m,
                 insns[n] = fetch_module((void *)m, guard_pc + (uint64_t)k);
                 n++;
             }
-            int r = plan_displaced(&e, m, insns, pcs, n, guard_pc, plen);
+            int r = plan_displaced(&e, m, insns, pcs, n, guard_pc, plen, out);
             if (r)
                 return r;
         }
@@ -389,6 +578,16 @@ int instr_plan_guard(const elf64_module_t *m,
     if (e.err)
         return INSTR_ERR_OTHER;
     out->tramp_words = e.n;
+
+    /* 5. block-guard 附加:扫描 caller 内目标落在补丁区的分支,重映射到 guard。
+     *    (call-guard 覆盖单条 bl,不涉及代码块,无需处理) */
+    out->fix_count = 0;
+    if (!is_call_guard) {
+        int rc = collect_external_fixups(m, caller_start, caller_end,
+                                         block_end, guard_pc, plen, out);
+        if (rc != INSTR_OK)
+            return rc;
+    }
 
     /* 4. 补丁字节 */
     if (plen == INSTR_PATCH_LEN) {

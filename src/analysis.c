@@ -20,7 +20,7 @@
 
 #define NARGS      8   /* 跟踪入口 x0~x7 */
 #define MAX_SLOTS  64
-#define MAX_INSNS  (1u << 20) /* 最多 1M 条指令(4MB 代码),支持很大的函数 */
+#define MAX_INSNS  (1u << 18) /* 最多 256K 条指令(1MB 代码),避免巨型函数内存爆炸 */
 #define MAX_PASSES 512
 
 typedef struct {
@@ -240,9 +240,20 @@ static int locate_args(a64_fetch_fn fetch, void *ctx,
     c.end = end;
     c.nslots = 0;
 
-    int n = (int)((end - start) / 4);
+    /*
+     * 分析窗口裁剪:入口参数在 guard_pc 处的存活只需 [start, guard_pc] 的
+     * 数据流,guard 之后的指令不影响结果。裁剪后 n 大幅减小:
+     *   巨型函数(如 Player.Update 数十 KB)下仍是紧凑的;
+     *   同时 cap 到 MAX_INSNS 防止 calloc 过大。
+     */
+    uint64_t eff_end = guard_pc + 4;   /* 只需扫到 guard 点(含) */
+    if (eff_end > end)
+        eff_end = end;
+    int n = (int)((eff_end - start) / 4);
     if (n > MAX_INSNS)
         n = MAX_INSNS;
+    if (n <= 0)
+        return -1;
 
     state_t *st = (state_t *)calloc((size_t)n, sizeof(state_t));
     uint8_t *valid = (uint8_t *)calloc((size_t)n, 1);

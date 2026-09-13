@@ -8,6 +8,7 @@
 #include "elf64.h"
 
 #include <string.h>
+#include <stdint.h>
 
 /* 用于 PLT 桩扫描的解码(避免依赖 a64.c:只需 adrp + ldr imm) */
 static uint32_t read32(const uint8_t *p) {
@@ -66,8 +67,52 @@ int elf64_module_init(elf64_module_t *m, const void *base, const void *image,
     m->shnum = eh->e_shnum;
     m->shstrndx = eh->e_shstrndx;
 
+    /*
+     * 用 program headers(PT_LOAD)推导模块映射范围。调用方传 size=0(未知)时,
+     * fetch 系列函数需要知道边界才能安全取指(否则可能读未映射内存 SIGSEGV)。
+     * 运行时场景:PT_LOAD 的 p_vaddr+p_memsz 即模块映射上界(相对基址)。
+     * 注意 p_vaddr 是模块内偏移(ET_DYN 基址为 0),== RVA。
+     */
+    if (m->size == 0 && eh->e_phoff != 0 && eh->e_phnum > 0) {
+        const elf64_phdr_t *phs =
+            (const elf64_phdr_t *)(img + eh->e_phoff);
+        uint64_t max_end = 0;
+        for (int i = 0; i < eh->e_phnum; i++) {
+            if (phs[i].p_type == PT_LOAD) {
+                uint64_t end = phs[i].p_vaddr + phs[i].p_memsz;
+                if (end > max_end)
+                    max_end = end;
+            }
+        }
+        if (max_end > 0 && max_end != UINT64_MAX)
+            m->size = (size_t)max_end;
+    }
+
     if (eh->e_shoff == 0 || eh->e_shnum == 0)
         return 0; /* 无节头(被 strip 的情况),后续查找都会失败 */
+
+    /*
+     * 运行时(live)模块保护:Android 只映射 PT_LOAD 段,节头表(e_shoff,文件偏移)
+     * 未必映射在 base+e_shoff。生产 libil2cpp.so 经常读不到 → 节头是垃圾,
+     * 直接 strcmp 节名会解引用垃圾指针(SIGSEGV)。
+     * 策略:live 运行时(image == base)一律跳过节头 —— block-guard 的取指走
+     * elf64_va_to_offset 的 va-base 分支,不依赖符号/PLT;
+     * 离线镜像(image != base,文件缓冲区)才解析节头(带边界校验)。
+     */
+    if (m->image == m->base) {
+        m->shnum = 0;
+        return 0;
+    }
+
+    size_t shdr_bytes = (size_t)eh->e_shnum * sizeof(elf64_shdr_t);
+    if (m->size) {
+        if ((uint64_t)eh->e_shoff > m->size ||
+            shdr_bytes > m->size - (size_t)eh->e_shoff)
+            return 0;
+    } else {
+        m->shnum = 0;
+        return 0;
+    }
 
     const elf64_shdr_t *shdrs =
         (const elf64_shdr_t *)(img + eh->e_shoff);
@@ -76,8 +121,11 @@ int elf64_module_init(elf64_module_t *m, const void *base, const void *image,
     /* 节名字符串表 */
     if (m->shstrndx < m->shnum) {
         const elf64_shdr_t *sh = &shdrs[m->shstrndx];
-        m->shstr = (const char *)img + sh->sh_offset;
-        m->shstr_size = (size_t)sh->sh_size;
+        if (sh->sh_offset <= m->size &&
+            sh->sh_size <= m->size - (size_t)sh->sh_offset) {
+            m->shstr = (const char *)img + sh->sh_offset;
+            m->shstr_size = (size_t)sh->sh_size;
+        }
     }
 
     for (int i = 0; i < m->shnum; i++) {
@@ -86,6 +134,10 @@ int elf64_module_init(elf64_module_t *m, const void *base, const void *image,
         if (m->shstr && sh->sh_name < m->shstr_size)
             name = m->shstr + sh->sh_name;
         if (!name)
+            continue;
+        /* 数据区也需在模块范围内,否则后续符号解析会解引用垃圾指针 */
+        if (sh->sh_offset > m->size ||
+            sh->sh_size > m->size - (size_t)sh->sh_offset)
             continue;
         const uint8_t *p = img + sh->sh_offset;
         if (strcmp(name, ".dynsym") == 0) {
