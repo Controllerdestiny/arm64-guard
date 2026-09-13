@@ -1,0 +1,17 @@
+# 构建产物
+build/
+
+# 本地工具缓存(可重新下载)
+tools/zig/
+tools/pylibs/
+.zig-global/
+.zig-local/
+.tmp/
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+Thumbs.db
+.DS_Store
