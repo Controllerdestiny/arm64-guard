@@ -335,7 +335,6 @@ static void test_analysis_flow(void) {
     }
 }
 
-
 static void test_a64_self(void) {
     printf("== a64 编码/解码自检 ==\n");
 
@@ -607,11 +606,32 @@ static int test_target(const char *path, const char *tag, int want_block,
             instr_plan_t ep;
             rc = instr_plan_entry_snapshot(&m, main_va, bend,
                                            TRAMP_BASE + 0x1000,
-                                           TRAMP_BASE + 0x2000, &ep);
+                                           TRAMP_BASE + 0x2000, 0, &ep);
             printf("plan(entry snap) rc=%d patch_len=%d tramp_words=%zu\n", rc,
                    ep.patch_len, ep.tramp_words);
             if (rc == INSTR_OK) {
                 fprintf(dump, "PLAN %s entry %016llx %d ", tag,
+                        (unsigned long long)main_va, ep.patch_len);
+                dump_hex(dump, ep.patch, (size_t)ep.patch_len);
+                fprintf(dump, " %zu ", ep.tramp_words);
+                for (size_t i = 0; i < ep.tramp_words; i++)
+                    fprintf(dump, "%08x", ep.tramp[i]);
+                fprintf(dump, "\n");
+            }
+        }
+
+        /* 链式共存规划:入口已有 Dobby 形态 hook 时,快照 trampoline
+         * 保存参数后直接跳进现有 hook 的 trampoline(不再重放入口指令) */
+        {
+            instr_plan_t ep;
+            rc = instr_plan_entry_snapshot(&m, main_va, bend,
+                                           TRAMP_BASE + 0x1000,
+                                           TRAMP_BASE + 0x2000,
+                                           TRAMP_BASE + 0x3000, &ep);
+            printf("plan(entry snap chained) rc=%d patch_len=%d "
+                   "tramp_words=%zu\n", rc, ep.patch_len, ep.tramp_words);
+            if (rc == INSTR_OK) {
+                fprintf(dump, "PLAN %s entrychain %016llx %d ", tag,
                         (unsigned long long)main_va, ep.patch_len);
                 dump_hex(dump, ep.patch, (size_t)ep.patch_len);
                 fprintf(dump, " %zu ", ep.tramp_words);
@@ -697,6 +717,77 @@ static int test_target(const char *path, const char *tag, int want_block,
     return 0;
 }
 
+/* ---------------- hook 免疫(磁盘镜像分析)测试 ---------------- */
+
+/*
+ * 模拟"先 hook 后分析"场景:Dobby 等框架先改写了函数入口后,
+ * 读运行时内存的分析器会读到 hook 跳转而非原始 prologue → NOLOC;
+ * 改用磁盘 .so 镜像(原始指令字节)后分析不受任何先行 hook 影响。
+ */
+static void test_hook_immunity(const char *path) {
+    printf("== hook 免疫(磁盘镜像分析)测试 ==\n");
+    size_t sz = 0;
+    uint8_t *img = read_file(path, &sz);
+    if (!img) {
+        chk(0, "读取目标文件");
+        return;
+    }
+    elf64_module_t m;
+    if (elf64_module_init(&m, (void *)(uintptr_t)RUNTIME_BASE, img, sz) != 0) {
+        chk(0, "解析 ELF");
+        free(img);
+        return;
+    }
+    uint64_t main_va, main_sz = 0;
+    if (elf64_find_symbol(&m, "main", &main_va, &main_sz) != 0) {
+        printf("  (skip: 目标中没有 main 符号)\n");
+        free(img);
+        return;
+    }
+    uint64_t main_end = find_end(&m, main_va, main_sz);
+    uint64_t guard = main_va + 0x40;
+
+    /* 1) 原始镜像:分析成功 */
+    a64_loc_t loc;
+    int rc = analysis_locate_first_arg(fetch_img, &m, main_va, main_end,
+                                       guard, &loc);
+    chk(rc == 0, "原始镜像上分析成功");
+
+    /* 2) 模拟 Dobby 先 hook 了入口:复制镜像并把入口改成 ldr/br 绝对跳转 */
+    uint8_t *mut = (uint8_t *)malloc(sz);
+    if (!mut) {
+        chk(0, "分配变异镜像");
+        free(img);
+        return;
+    }
+    memcpy(mut, img, sz);
+    elf64_module_t mm;
+    elf64_module_init(&mm, (void *)(uintptr_t)RUNTIME_BASE, mut, sz);
+    {
+        uint64_t pc = main_va;
+        uint32_t w0 = a64_insn_ldr_lit(16, 1, pc + 8, pc);
+        uint32_t w1 = a64_insn_br(16);
+        uint64_t q = 0x12345678;
+        ptrdiff_t off = elf64_va_to_offset(&mm, pc);
+        if (off >= 0 && (size_t)off + 16 <= sz) {
+            memcpy(mut + off, &w0, 4);
+            memcpy(mut + off + 4, &w1, 4);
+            memcpy(mut + off + 8, &q, 8);
+        }
+    }
+    rc = analysis_locate_first_arg(fetch_img, &mm, main_va, main_end,
+                                   guard, &loc);
+    chk(rc != 0, "入口被 hook 后读内存分析失败(NOLOC,不产生错误补丁)");
+
+    /* 3) 读磁盘镜像 = 原始字节,分析不受 hook 影响 */
+    rc = analysis_locate_first_arg(fetch_img, &m, main_va, main_end,
+                                   guard, &loc);
+    chk(rc == 0, "读磁盘镜像(原始字节)分析不受先行 hook 影响");
+
+    free(mut);
+    free(img);
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0); /* 崩溃时也能看到输出 */
     if (argc < 3) {
@@ -708,6 +799,7 @@ int main(int argc, char **argv) {
     test_a64_self();
     test_decode_corpus();
     test_analysis_flow();
+    test_hook_immunity(argv[2]);
 
     FILE *dump = fopen(argv[3], "w");
     if (!dump) {

@@ -132,7 +132,7 @@ def verify_plans(plans):
         has_cbz = any(m == "cbz" for m, o in mns)
         has_snapshot_store = any(
             m == "str" and "[x9, #" in o for m, o in mns)
-        if kind == "entry":
+        if kind in ("entry", "entrychain"):
             # 入口快照 trampoline:全保存 + 快照存储(x0~x7 -> [x9,#N])+ 结尾 br
             has_tail_br = any(m == "br" for m, o in mns)
             check(has_save and has_snapshot_store and has_tail_br,

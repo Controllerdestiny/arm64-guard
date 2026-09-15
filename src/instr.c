@@ -150,7 +150,8 @@ static uint64_t scan_fn_end(const elf64_module_t *m, uint64_t va) {
  */
 static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
                       uint64_t guard, int is_call_guard, uint64_t block_end,
-                      uint64_t check, uint64_t callee, int snap_mode) {
+                      uint64_t check, uint64_t callee, int snap_mode,
+                      uint64_t prev_hook) {
     instr_plan_t plan;
     instr_plan_t ep; /* 入口快照计划(仅 snap_mode 使用) */
     int rc;
@@ -169,7 +170,7 @@ static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
     }
     if (snap_mode) {
         rc = instr_plan_entry_snapshot(m, cstart, block_end, 0x1000, 0x2000,
-                                       &ep);
+                                       prev_hook, &ep);
         if (rc != INSTR_OK) {
             set_err("entry snapshot plan failed: %d", rc);
             return rc;
@@ -221,7 +222,7 @@ static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
     /* ---- 入口快照补丁:先应用(守卫补丁与它互不重叠) ---- */
     if (snap_mode) {
         rc = instr_plan_entry_snapshot(m, cstart, block_end, snap,
-                                       entry_base, &ep);
+                                       entry_base, prev_hook, &ep);
         if (rc != INSTR_OK) {
             set_err("entry snapshot re-plan failed: %d", rc);
             munmap(tramp, TRAMP_PAGE * pages);
@@ -297,6 +298,100 @@ static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
 
 /* ---------------- 公共 API ---------------- */
 
+/*
+ * 初始化模块用于分析与规划。优先打开磁盘上的 .so 文件作为指令镜像:
+ * 即使函数入口已被其它 hook 框架(如 Dobby)先行改写,分析器仍读到
+ * 原始指令字节,参数分析不受影响;打开失败(内存加载 / 无读权限 /
+ * 被 strip 无节头)则回退到读运行时内存。
+ * *filebuf_out 需要调用方在 apply 完成后 free(失败时为 NULL)。
+ */
+static int init_module(elf64_module_t *m, void *fbase, const char *fname,
+                       uint8_t **filebuf_out, size_t *filesz_out) {
+    *filebuf_out = NULL;
+    *filesz_out = 0;
+    if (fname && fname[0]) {
+        FILE *f = fopen(fname, "rb");
+        if (f) {
+            if (fseek(f, 0, SEEK_END) == 0) {
+                long n = ftell(f);
+                if (n > 0) {
+                    fseek(f, 0, SEEK_SET);
+                    uint8_t *buf = (uint8_t *)malloc((size_t)n);
+                    if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n) {
+                        /* 离线镜像路径需要节表,失败则释放并回退 */
+                        if (elf64_module_init(m, fbase, buf, (size_t)n) == 0 &&
+                            m->shnum > 0) {
+                            *filebuf_out = buf;
+                            *filesz_out = (size_t)n;
+                            fclose(f);
+                            return 0;
+                        }
+                        free(buf);
+                    } else if (buf) {
+                        free(buf);
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+    /* 回退:读运行时内存(不带节头) */
+    return elf64_module_init(m, fbase, NULL, 0);
+}
+
+/*
+ * 快照模式安装前的"入口占用检测":
+ *   - 有磁盘镜像:逐字节对比运行时入口 16 字节与镜像 —— 不一致即被占用;
+ *   - 无镜像:启发式识别绝对跳转补丁形态(ldr x16,[pc,#8]; br x16,
+ *     与 Dobby/本库的形态 B 一致)。
+ * 返回 1 = 入口已被占用(拒绝安装),0 = 空闲。
+ */
+static int entry_busy(const elf64_module_t *m, uint64_t fn) {
+    if (m->image && m->image != m->base) {
+        const uint8_t *live = (const uint8_t *)(uintptr_t)fn;
+        for (int i = 0; i < 16; i++) {
+            ptrdiff_t off = elf64_va_to_offset(m, fn + (uint64_t)i);
+            if (off < 0)
+                return 1; /* 镜像读不到对应字节,保守拒绝 */
+            if (live[i] != ((const uint8_t *)m->image)[off])
+                return 1;
+        }
+        return 0;
+    }
+    uint32_t w0, w1;
+    memcpy(&w0, (void *)(uintptr_t)fn, 4);
+    memcpy(&w1, (void *)(uintptr_t)fn + 4, 4);
+    return w0 == a64_insn_ldr_lit(16, 1, fn + 8, fn) && w1 == a64_insn_br(16);
+}
+
+/*
+ * 解析入口上现有 hook 的跳转目标(链式共存用):
+ *   - 形态 B:ldr x16, [pc, #8]; br x16; .quad target —— 从运行时读 .quad;
+ *   - 形态 A:adrp x16, page; add x16, x16, #lo12; br x16 —— 解码计算。
+ * 返回 hook trampoline 地址;无法识别返回 0(调用方应拒绝,避免覆盖)。
+ */
+static uint64_t parse_prev_hook(uint64_t fn) {
+    uint32_t w0, w1, w2;
+    memcpy(&w0, (void *)(uintptr_t)fn, 4);
+    memcpy(&w1, (void *)(uintptr_t)fn + 4, 4);
+    memcpy(&w2, (void *)(uintptr_t)fn + 8, 4);
+    a64_insn_t d0, d1, d2;
+    a64_decode(fn, w0, &d0);
+    a64_decode(fn + 4, w1, &d1);
+    a64_decode(fn + 8, w2, &d2);
+    if (d0.kind == A64_LDR_LIT && d0.rt == 16 && d0.target == fn + 8 &&
+        d1.kind == A64_BR && d1.rn == 16) {
+        uint64_t tgt;
+        memcpy(&tgt, (void *)(uintptr_t)fn + 8, 8);
+        return tgt;
+    }
+    if (d0.kind == A64_ADRP && d0.rd == 16 && d1.kind == A64_ADD_IMM &&
+        d1.rd == 16 && d1.rn == 16 && d2.kind == A64_BR && d2.rn == 16) {
+        return d0.page + (uint64_t)d1.imm;
+    }
+    return 0;
+}
+
 int instr_guard_block(void *fn, void *block_start, void *block_end,
                       void *check) {
     if (!fn || !block_start || !block_end || !check) {
@@ -310,7 +405,9 @@ int instr_guard_block(void *fn, void *block_start, void *block_end,
         return INSTR_ERR_ARG;
     }
     elf64_module_t m;
-    if (elf64_module_init(&m, info.dli_fbase, NULL, 0) != 0) {
+    uint8_t *img = NULL;
+    size_t imgsz = 0;
+    if (init_module(&m, info.dli_fbase, info.dli_fname, &img, &imgsz) != 0) {
         set_err("module at %p is not an AArch64 ELF", info.dli_fbase);
         return INSTR_ERR_NOT_ELF;
     }
@@ -323,12 +420,15 @@ int instr_guard_block(void *fn, void *block_start, void *block_end,
         bend <= bstart || bend > (uint64_t)(uintptr_t)m.base + m.size) {
         set_err("block [%p, %p) out of module range base=%p size=0x%zx",
                 block_start, block_end, (void *)m.base, m.size);
+        free(img);
         return INSTR_ERR_RANGE;
     }
 
     uint64_t cend = scan_fn_end(&m, cstart); /* 支持很大的函数 */
-    return apply_plan(&m, cstart, cend, bstart, 0, bend,
-                      (uint64_t)(uintptr_t)check, 0, 0);
+    int rc = apply_plan(&m, cstart, cend, bstart, 0, bend,
+                        (uint64_t)(uintptr_t)check, 0, 0, 0);
+    free(img);
+    return rc;
 }
 
 int instr_guard_block_snap(void *fn, void *block_start, void *block_end,
@@ -343,7 +443,9 @@ int instr_guard_block_snap(void *fn, void *block_start, void *block_end,
         return INSTR_ERR_ARG;
     }
     elf64_module_t m;
-    if (elf64_module_init(&m, info.dli_fbase, NULL, 0) != 0) {
+    uint8_t *img = NULL;
+    size_t imgsz = 0;
+    if (init_module(&m, info.dli_fbase, info.dli_fname, &img, &imgsz) != 0) {
         set_err("module at %p is not an AArch64 ELF", info.dli_fbase);
         return INSTR_ERR_NOT_ELF;
     }
@@ -357,12 +459,37 @@ int instr_guard_block_snap(void *fn, void *block_start, void *block_end,
         bend <= bstart || bend > (uint64_t)(uintptr_t)m.base + m.size) {
         set_err("block [%p, %p) invalid for snapshot mode (need block_start "
                 ">= fn+16, in-module)", block_start, block_end);
+        free(img);
         return INSTR_ERR_RANGE;
     }
 
+    /* 入口占用检测:与 Dobby 等 hook 框架互斥,拒绝静默互相覆盖。
+     * 若入口已被占用且 hook 形态可解析(ldr/br 或 adrp/add/br),则进入
+     * 链式共存:快照 trampoline 保存参数后直接跳进现有 hook 的 trampoline。 */
+    uint64_t prev_hook = 0;
+    if (entry_busy(&m, cstart)) {
+        prev_hook = parse_prev_hook(cstart);
+        if (prev_hook == 0) {
+            set_err("entry of %p is hooked by an unrecognized framework; "
+                    "cannot chain snapshot guard", fn);
+            free(img);
+            return INSTR_ERR_ENTRY_BUSY;
+        }
+        /* 同一函数重复安装快照守卫:入口已是我们自己的补丁,拒绝 */
+        for (int i = 0; i < MAX_RECS; i++) {
+            if (g_recs[i].used && g_recs[i].addr == cstart) {
+                set_err("snapshot guard already installed on %p", fn);
+                free(img);
+                return INSTR_ERR_ENTRY_BUSY;
+            }
+        }
+    }
+
     uint64_t cend = scan_fn_end(&m, cstart);
-    return apply_plan(&m, cstart, cend, bstart, 0, bend,
-                      (uint64_t)(uintptr_t)check, 0, 1);
+    int rc = apply_plan(&m, cstart, cend, bstart, 0, bend,
+                        (uint64_t)(uintptr_t)check, 0, 1, prev_hook);
+    free(img);
+    return rc;
 }
 
 int instr_unpatch(void *patched_addr) {

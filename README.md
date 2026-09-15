@@ -204,6 +204,22 @@ tools/                     构建与验证脚本(NDK / zig / capstone / unicorn)
 - 分析窗口上限 256K 条指令:守卫点距函数入口超过该距离时报 `INSTR_ERR_NOLOC`
   (快照模式不受此限)。
 
+## 与 Dobby 等 hook 框架共存
+
+两者都靠改写代码字节,遵守以下规则可避免冲突:
+
+| 场景 | 是否可共存 | 说明 |
+|---|---|---|
+| 不同函数:一个用 arm64-guard,另一个用 Dobby | ✅ | 互不影响 |
+| 同一函数:Dobby(hook 入口)+ `instr_guard_block`(数据流,不碰入口) | ✅ | 任意顺序均可 —— 分析器优先读磁盘 .so 镜像(原始指令字节),Dobby 先改入口也不影响参数分析;装好后两者各自占用不同字节 |
+| 同一函数:Dobby + `instr_guard_block_snap` | ✅(需先装 Dobby) | **hook 链共存**:先装 Dobby,再装快照守卫 —— 快照安装前检测到入口已被占用,自动解析现有 hook(形态 A `adrp/add/br` 或形态 B `ldr/br/.quad`)并链式接入:入口先走我们的快照 trampoline 保存 x0~x7,再跳进 Dobby 的 trampoline 正常执行 —— 两条 hook 同时生效,互不覆盖 |
+| 同一函数:先装 `instr_guard_block_snap` 再装 Dobby | ⚠️ 不保证 | Dobby 会把我们的入口补丁当作"原始指令"搬进它的 trampoline,行为取决于 Dobby 实现;同一函数建议按"Dobby 先、快照后"的顺序 |
+| 入口被无法识别的 hook 占用(非 ldr/br 或 adrp/add/br 形态) | ❌ | 返回 `INSTR_ERR_ENTRY_BUSY`,拒绝静默覆盖 |
+
+要点:同一函数上**入口只能有一个主人** —— 想 hook 入口用 Dobby(或
+`instr_guard_block_snap`,可链在 Dobby 之后),想在函数内部做条件执行守卫用
+`instr_guard_block`,三者可按上表组合。
+
 ## License
 
 [MIT](LICENSE)

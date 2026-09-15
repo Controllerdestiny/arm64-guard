@@ -80,12 +80,17 @@ int instr_plan_guard(const elf64_module_t *m,
  *   入口 trampoline 把 x0~x7 保存到 snap_addr,重放入口被覆盖的指令,
  *   再跳回 fn+16。之后任何守卫点都能从 snap_addr 读到入口参数(100% 可恢复,
  *   与函数内部复杂度无关,类似 dobby 的入口 hook)。
+ *
+ * prev_hook != 0 时进入"链式共存"模式:入口已被其它 hook 框架(如 Dobby)
+ * 占用,入口 trampoline 保存完 x0~x7 后直接跳到 prev_hook(现有 hook 的
+ * trampoline 地址),由它继续重放原始指令 —— 快照 hook 与 Dobby 同时生效。
+ *
  * block_end 用于外部回跳修复的扫描范围。返回 0 成功。
  */
 int instr_plan_entry_snapshot(const elf64_module_t *m,
                               uint64_t fn, uint64_t block_end,
                               uint64_t snap_addr, uint64_t entry_tramp_base,
-                              instr_plan_t *out);
+                              uint64_t prev_hook, instr_plan_t *out);
 
 #ifdef __cplusplus
 }

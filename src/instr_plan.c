@@ -678,7 +678,7 @@ int instr_plan_guard(const elf64_module_t *m,
 int instr_plan_entry_snapshot(const elf64_module_t *m,
                               uint64_t fn, uint64_t block_end,
                               uint64_t snap_addr, uint64_t entry_tramp_base,
-                              instr_plan_t *out) {
+                              uint64_t prev_hook, instr_plan_t *out) {
     if (!m || !out || (fn & 3))
         return INSTR_ERR_ARG;
 
@@ -701,15 +701,24 @@ int instr_plan_entry_snapshot(const elf64_module_t *m,
     e.base = entry_tramp_base;
     e.err = 0;
 
-    /* 保存完整现场 → 快照 x0~x7 → 恢复现场(重放指令看到与入口一致的寄存器) */
+    /* 保存完整现场 → 快照 x0~x7 → 恢复现场 */
     emit_save_all(&e);
     em_put_lit(&e, 9, snap_addr);
     for (int k = 0; k < ANALYSIS_NARGS; k++)
         em_put(&e, a64_insn_str_imm(k, 9, 8 * k, 1));
     emit_restore_all(&e);
 
-    /* 重放入口被覆盖的 4 条指令 */
-    {
+    if (prev_hook != 0) {
+        /*
+         * 链式共存模式:入口已被其它 hook 框架(如 Dobby)占用。
+         * 快照完成后直接跳进现有 hook 的 trampoline,由它重放原始入口
+         * 指令并继续 —— 快照 hook 与 Dobby 同时生效,互不覆盖。
+         * (x16 被用作跳转寄存器,属 IP0 临时寄存器,风险可忽略。)
+         */
+        em_put_lit(&e, 16, prev_hook);
+        em_put(&e, a64_insn_br(16));
+    } else {
+        /* 普通模式:重放入口被覆盖的 4 条指令,再跳回 fn+16 */
         uint64_t pcs[4];
         uint32_t insns[4];
         for (int k = 0; k < 4; k++) {
@@ -719,9 +728,9 @@ int instr_plan_entry_snapshot(const elf64_module_t *m,
         int r = plan_displaced(&e, m, insns, pcs, 4, fn, 16, out);
         if (r)
             return r;
+        em_put_lit(&e, 16, fn + 16);
+        em_put(&e, a64_insn_br(16));
     }
-    em_put_lit(&e, 16, fn + 16);
-    em_put(&e, a64_insn_br(16));
 
     if (e.err)
         return INSTR_ERR_OTHER;

@@ -47,6 +47,7 @@ enum {
     INSTR_ERR_RANGE,      /* 块范围非法:end-start < 12 或越界               */
     INSTR_ERR_UNALIGNED,  /* 地址未 4 字节对齐                             */
     INSTR_ERR_NOTPATCHED, /* instr_unpatch:该地址未被本库修补              */
+    INSTR_ERR_ENTRY_BUSY, /* 入口快照模式:函数入口已被其它 hook 占用        */
     INSTR_ERR_OTHER
 };
 
