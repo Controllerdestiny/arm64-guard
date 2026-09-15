@@ -22,7 +22,7 @@ extern "C" {
 
 #define INSTR_PATCH_LEN   12   /* 形态 A 补丁长度                          */
 #define INSTR_PATCH_MAX   16   /* 形态 B 补丁长度(缓冲上限)                */
-#define INSTR_TRAMP_MAX   192  /* trampoline 最大指令字(含字面量池)        */
+#define INSTR_TRAMP_MAX   256  /* trampoline 最大指令字(含字面量池)        */
 #define INSTR_FIX_MAX     64   /* 外部回跳补丁区的分支重映射上限            */
 
 /* 外部分支修复项:函数内某条分支的目标原本落在补丁区内,将其目标重映射。 */
@@ -47,6 +47,7 @@ typedef struct {
     size_t tramp_words;
     int is_call_guard;
     uint64_t block_end;      /* block-guard 的块尾(call-guard 为 0)        */
+    uint64_t snap_addr;      /* 入口快照区地址(0 = 数据流分析模式)         */
     instr_disp_t disp[8];    /* 被搬移指令 原地址->trampoline 新地址        */
     int disp_count;
     instr_fix_t fixes[INSTR_FIX_MAX]; /* 外部回跳补丁区的分支重映射        */
@@ -71,7 +72,20 @@ int instr_plan_guard(const elf64_module_t *m,
                      uint64_t guard_pc, int is_call_guard,
                      uint64_t block_end, uint64_t check_addr,
                      uint64_t callee_addr, uint64_t tramp_base,
-                     instr_plan_t *out);
+                     uint64_t snap_addr, instr_plan_t *out);
+
+/*
+ * 规划函数入口的"参数快照"补丁(入口快照模式):
+ *   fn 入口被改写为 16 字节跳转到 entry_tramp_base 处的入口 trampoline,
+ *   入口 trampoline 把 x0~x7 保存到 snap_addr,重放入口被覆盖的指令,
+ *   再跳回 fn+16。之后任何守卫点都能从 snap_addr 读到入口参数(100% 可恢复,
+ *   与函数内部复杂度无关,类似 dobby 的入口 hook)。
+ * block_end 用于外部回跳修复的扫描范围。返回 0 成功。
+ */
+int instr_plan_entry_snapshot(const elf64_module_t *m,
+                              uint64_t fn, uint64_t block_end,
+                              uint64_t snap_addr, uint64_t entry_tramp_base,
+                              instr_plan_t *out);
 
 #ifdef __cplusplus
 }

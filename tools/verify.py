@@ -71,7 +71,9 @@ def verify_disa(dump):
         elif p[0] == "SITE":
             sites.setdefault(p[1], []).append(int(p[2], 16))
     for tag, info in infos.items():
-        path = "build/target_o0.so" if tag == "call" else "build/target_block.so"
+        path = ("build/target_o0.so" if tag == "call"
+                else "build/libtarget_complex.so" if tag == "complex"
+                else "build/target_block.so")
         data = open(path, "rb").read()
         segs = load_segments(data)
         o = off_of(data, segs, info["main"])
@@ -113,18 +115,31 @@ def verify_plans(plans):
     print("== 2. trampoline 与补丁字节校验 ==")
     for (tag, kind), (guard, patch, words, plen) in plans.items():
         check(len(patch) == plen, f"[{tag}/{kind}] 补丁字节数一致")
-        check(len(words) == int(plans[(tag, kind)][3] and 0) or len(words) > 0,
-              f"[{tag}/{kind}] trampoline 非空")
-        blob = b"".join(struct.pack("<I", w) for w in words)
-        dis = list(md.disasm(blob, TRAMP_BASE))
-        mns = [(i.mnemonic, i.op_str) for i in dis]
+        check(len(words) > 0, f"[{tag}/{kind}] trampoline 非空")
+
+        # 逐字反汇编:字面量池数据可能不是合法指令,线性 disasm 会在数据处
+        # 提前停止,导致 blr/cbz 等靠后的指令检测不到 —— 逐字跳过非法数据。
+        mns = []
+        for i, w in enumerate(words):
+            blob = struct.pack("<I", w)
+            dis = list(md.disasm(blob, TRAMP_BASE + i * 4))
+            if dis:
+                mns.append((dis[0].mnemonic, dis[0].op_str))
         text = " ; ".join(f"{m} {o}" for m, o in mns)
         print(f"  [{tag}/{kind}] tramp @ {TRAMP_BASE:#x}: {text}")
         has_save = any(m == "stp" and "#-0x10]!" in o for m, o in mns)
         has_blr = any(m == "blr" for m, o in mns)
         has_cbz = any(m == "cbz" for m, o in mns)
-        check(has_save and has_blr and has_cbz,
-              f"[{tag}/{kind}] 保存现场 + blr + cbz 守卫结构")
+        has_snapshot_store = any(
+            m == "str" and "[x9, #" in o for m, o in mns)
+        if kind == "entry":
+            # 入口快照 trampoline:全保存 + 快照存储(x0~x7 -> [x9,#N])+ 结尾 br
+            has_tail_br = any(m == "br" for m, o in mns)
+            check(has_save and has_snapshot_store and has_tail_br,
+                  f"[{tag}/{kind}] 入口快照结构(保存 + 快照存储 + br)")
+        else:
+            check(has_save and has_blr and has_cbz,
+                  f"[{tag}/{kind}] 保存现场 + blr + cbz 守卫结构")
         pdis = list(md.disasm(patch, guard))
         ptxt = " ; ".join(f"{i.mnemonic} {i.op_str}" for i in pdis)
         print(f"  [{tag}/{kind}] patch @ {guard:#x} ({plen}B): {ptxt}")
@@ -133,7 +148,8 @@ def verify_plans(plans):
                   pdis[1].mnemonic == "add" and pdis[2].mnemonic == "br",
                   f"[{tag}/{kind}] 形态 A 补丁 = adrp/add/br")
         else:
-            check(len(pdis) == 3 and pdis[0].mnemonic == "ldr" and
+            # 形态 B = ldr x16,[pc,#8]; br x16; .quad(数据可能解不出指令)
+            check(len(pdis) >= 2 and pdis[0].mnemonic == "ldr" and
                   pdis[1].mnemonic == "br",
                   f"[{tag}/{kind}] 形态 B 补丁 = ldr/br/.quad")
 

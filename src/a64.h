@@ -30,12 +30,15 @@ typedef enum {
     A64_MOV_REG,       /* mov w/xD, w/xM (orr xzr)                        */
     A64_MOV_IMM,       /* movz/movk/movn w/xD, #imm                       */
     A64_ADD_IMM,       /* add/sub w/xD, w/xN, #imm                        */
-    A64_STR_IMM,       /* str w/x, [base, #off] (unsigned/pre/post)       */
-    A64_LDR_IMM,       /* ldr w/x, [base, #off] (unsigned/pre/post)       */
-    A64_STUR,          /* stur w/x, [base, #off]                          */
-    A64_LDUR,          /* ldur w/x, [base, #off]                          */
+    A64_STR_IMM,       /* str w/x, [base, #off] (unsigned)                */
+    A64_LDR_IMM,       /* ldr w/x, [base, #off] (unsigned)                */
+    A64_STUR,          /* stur/sturb/sturh w/x, [base, #off]              */
+    A64_LDUR,          /* ldur/ldurb/ldurh/ldursb/ldursh w/x, [base,#off] */
     A64_STP,           /* stp w/x (unsigned/pre/post)                     */
     A64_LDP,           /* ldp w/x (unsigned/pre/post)                     */
+    A64_STR_BH,        /* strb/strh w, [base, #off] (unsigned)            */
+    A64_LDR_BH,        /* ldrb/ldrh/ldrsb/ldrsh w, [base, #off] (unsigned)*/
+    A64_LDSTR_REG,     /* ldr/str w/x, [base, reg] (寄存器偏移)            */
     A64_MRS,           /* mrs xD, nzcv(及其它系统寄存器,按写 Rd 处理)     */
     A64_MSR,           /* msr nzcv, xN(及写系统寄存器,按无害处理)         */
     A64_OTHER          /* 其它写 Rd 的指令(按 kill Rd 处理)               */
@@ -51,6 +54,8 @@ typedef struct {
     int64_t imm;        /* 立即数(载荷偏移 / mov 立即数 / add 立即数)      */
     uint64_t target;    /* 分支/字面量/adr 解析后的目标地址                 */
     uint64_t page;      /* adrp 解析后的页地址                             */
+    int mem_mode;       /* 0=偏移(无写回) 1=post-index 2=pre-index         */
+    int mem_width;      /* 内存访问宽度 1/2/4/8(字节/半字/字/双字)         */
     int updates_rn;     /* pre/post 索引寻址:指令会写回 rn                 */
     int is_load;        /* 读内存                                          */
     int is_store;       /* 写内存                                          */
@@ -74,8 +79,11 @@ uint32_t a64_insn_adr(int rd, uint64_t target, uint64_t pc);
 uint32_t a64_insn_ldr_lit(int rt, int is64, uint64_t target, uint64_t pc);
 uint32_t a64_insn_mov_reg(int rd, int rm, int is64);
 uint32_t a64_insn_movz(int rd, uint16_t imm, int shift16, int is64);
+uint32_t a64_insn_movk(int rd, uint16_t imm, int shift16, int is64);
 uint32_t a64_insn_add_imm(int rd, int rn, uint16_t imm, int is64);
 uint32_t a64_insn_sub_imm(int rd, int rn, uint16_t imm, int is64);
+uint32_t a64_insn_add_reg(int rd, int rn, int rm);   /* add xD, xN, xM      */
+uint32_t a64_insn_sub_reg(int rd, int rn, int rm);   /* sub xD, xN, xM      */
 uint32_t a64_insn_str_imm(int rt, int rn, int64_t off, int is64);
 uint32_t a64_insn_ldr_imm(int rt, int rn, int64_t off, int is64);
 uint32_t a64_insn_str_pre(int rt, int rn, int64_t off, int is64);  /* str, [rn, #off]! */

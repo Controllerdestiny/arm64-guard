@@ -29,6 +29,8 @@ void a64_decode(uint64_t pc, uint32_t insn, a64_insn_t *o) {
     o->imm = 0;
     o->target = 0;
     o->page = 0;
+    o->mem_mode = 0;
+    o->mem_width = 0;
     o->updates_rn = 0;
     o->is_load = 0;
     o->is_store = 0;
@@ -147,16 +149,20 @@ void a64_decode(uint64_t pc, uint32_t insn, a64_insn_t *o) {
         return;
     }
 
-    /* mov wD, wM = orr wD, wzr, wM(shift=0, N=0, imm6=0, Rn=31) */
+    /* mov wD, wM = orr wD, wzr, wM(shift=0, imm6=0, 源在 Rm)
+     * 或 orr wD, wM, wzr(源在 Rn)——两种汇编器形式都识别 */
     /* 字段:Rm = bits[20:16], imm6 = bits[15:10], Rn = bits[9:5], Rd = bits[4:0] */
     if (((u & 0x7F000000) == 0x2A000000 || (u & 0x7F000000) == 0xAA000000) &&
-        (u & 0x00E00000) == 0 && (u & 0x0000FC00) == 0 &&
-        (u & 0x000003E0) == 0x000003E0) {
-        o->kind = A64_MOV_REG;
-        o->is64 = (u & 0x80000000) ? 1 : 0;
-        o->rd = (int)(u & 31);
-        o->rm = (int)((u >> 16) & 31);
-        return;
+        (u & 0x00E00000) == 0 && (u & 0x0000FC00) == 0) {
+        int rn = (int)((u >> 5) & 31);
+        int rm = (int)((u >> 16) & 31);
+        if (rn == 31 || rm == 31) { /* mov 别名:另一操作数必须是 xzr */
+            o->kind = A64_MOV_REG;
+            o->is64 = (u & 0x80000000) ? 1 : 0;
+            o->rd = (int)(u & 31);
+            o->rm = (rm == 31) ? rn : rm;
+            return;
+        }
     }
 
     /* movz / movk / movn */
@@ -183,20 +189,39 @@ void a64_decode(uint64_t pc, uint32_t insn, a64_insn_t *o) {
     }
 
     /*
-     * 立即数存取两族:
-     *   imm12 族(bits[25:22] = 0100/0101/0110):
-     *     [21:10] imm12(无 mode 位!),str w/x = 0xB9/0xF9,ldr = 0xB9|0x40,
-     *     ldrsw = 0xB9800000
-     *   imm9 族(bits[25:22] = 0000/0001):
-     *     [21:12] imm9,[11:10] mode(00 无缩放 / 01 post / 10 pre)
-     *     stur = 0xB8/0xF8,ldur = 0xB8|0x40
+     * 立即数存取族(imm12,无写回):
+     *   [21:10] imm12(按元素宽度缩放),str/ldr w/x = 0xB9/0xF9 系,
+     *   ldrsw = 0xB9800000,strb/ldrb = 0x39 系,strh/ldrh = 0x79 系
      */
+    if ((u & 0xFFC00000) == 0x39000000 || (u & 0xFFC00000) == 0x79000000) {
+        o->kind = A64_STR_BH;              /* strb/strh */
+        o->rt = (int)(u & 31);
+        o->rn = (int)((u >> 5) & 31);
+        o->imm = ((u >> 10) & 0xFFF) << ((u & 0x40000000) ? 1 : 0);
+        o->mem_width = (u & 0x40000000) ? 2 : 1;
+        o->is_store = 1;
+        return;
+    }
+    if ((u & 0xFFC00000) == 0x39400000 || (u & 0xFFC00000) == 0x79400000 ||
+        (u & 0xFFC00000) == 0x39800000 || (u & 0xFFC00000) == 0x79800000 ||
+        (u & 0xFFC00000) == 0x39C00000 || (u & 0xFFC00000) == 0x79C00000) {
+        /* ldrb/ldrh/ldrsb(x/w)/ldrsh(x/w):opc=10 → Xt,opc=11 → Wt */
+        o->kind = A64_LDR_BH;
+        o->is64 = ((u & 0x00C00000) == 0x00800000) ? 1 : 0;
+        o->rt = (int)(u & 31);
+        o->rn = (int)((u >> 5) & 31);
+        o->imm = ((u >> 10) & 0xFFF) << ((u & 0x40000000) ? 1 : 0);
+        o->mem_width = (u & 0x40000000) ? 2 : 1;
+        o->is_load = 1;
+        return;
+    }
     if ((u & 0xFFC00000) == 0xB9000000 || (u & 0xFFC00000) == 0xF9000000) {
         o->kind = A64_STR_IMM;
         o->is64 = (u & 0x80000000) ? 1 : 0;
         o->rt = (int)(u & 31);
         o->rn = (int)((u >> 5) & 31);
         o->imm = ((u >> 10) & 0xFFF) << (o->is64 ? 3 : 2);
+        o->mem_width = o->is64 ? 8 : 4;
         o->is_store = 1;
         return;
     }
@@ -206,6 +231,7 @@ void a64_decode(uint64_t pc, uint32_t insn, a64_insn_t *o) {
         o->rt = (int)(u & 31);
         o->rn = (int)((u >> 5) & 31);
         o->imm = ((u >> 10) & 0xFFF) << (o->is64 ? 3 : 2);
+        o->mem_width = o->is64 ? 8 : 4;
         o->is_load = 1;
         return;
     }
@@ -216,23 +242,52 @@ void a64_decode(uint64_t pc, uint32_t insn, a64_insn_t *o) {
         o->rt = (int)(u & 31);
         o->rn = (int)((u >> 5) & 31);
         o->imm = ((u >> 10) & 0xFFF) << 2;
+        o->mem_width = 4;
         o->is_load = 1;
         return;
     }
 
-    /* stur / ldur / pre / post(imm9 族,含 mode 位) */
-    if ((u & 0xFFC00000) == 0xB8000000 || (u & 0xFFC00000) == 0xF8000000 ||
-        (u & 0xFFC00000) == 0xB8400000 || (u & 0xFFC00000) == 0xF8400000) {
-        int is_ldr = ((u & 0xFFC00000) == 0xB8400000 ||
-                      (u & 0xFFC00000) == 0xF8400000);
+    /*
+     * 两个"111000"家族(按 bit21 区分):
+     *   - 立即数偏移家族(imm9,bit21=0):stur/ldur 及字节/半字、pre/post/unpriv
+     *     [21:12] imm9,[11:10] mode(00 无缩放 / 01 post / 10 unpriv / 11 pre)
+     *   - 寄存器偏移家族(bit21=1):ldr/str x, [base, reg] 及字节/半字/ldrsw
+     *     Rm=[20:16], option=[15:13], S=[12]
+     * 两者语义对分析相同:store 不注册槽位、不杀 rt;load 杀 rt。
+     */
+    if ((u & 0x3F200000) == 0x38000000) {
+        int size = (int)((u >> 30) & 3);
+        int opc = (int)((u >> 22) & 3);
+        /* 1=普通加载;2=符号扩展加载(Xt);3=符号扩展加载(Wt,仅 size<2) */
+        int is_ldr = (opc == 1) || (size < 3 && opc == 2) ||
+                     (size < 2 && opc == 3);
         o->kind = is_ldr ? A64_LDUR : A64_STUR;
-        o->is64 = (u & 0x80000000) ? 1 : 0;
+        o->is64 = (size == 3) || (size == 2 && opc == 2) ||
+                  (size < 2 && opc == 2);
         o->rt = (int)(u & 31);
         o->rn = (int)((u >> 5) & 31);
         o->imm = sext((u >> 12) & 0x1FF, 9);
-        int mode = (int)((u >> 10) & 3);
-        if (mode == 1 || mode == 3) /* post / pre:写回 rn;mode 2 为 unprivileged */
-            o->updates_rn = 1;
+        o->mem_width = size < 3 ? (1 << size) : 8;
+        o->mem_mode = (int)((u >> 10) & 3);
+        o->updates_rn = (o->mem_mode == 1 || o->mem_mode == 3) ? 1 : 0;
+        if (is_ldr)
+            o->is_load = 1;
+        else
+            o->is_store = 1;
+        return;
+    }
+    if ((u & 0x3F200000) == 0x38200000) {
+        int size = (int)((u >> 30) & 3);
+        int opc = (int)((u >> 22) & 3);
+        int is_ldr = (opc == 1) || (size < 3 && opc == 2) ||
+                     (size < 2 && opc == 3);
+        o->kind = A64_LDSTR_REG;
+        o->is64 = (size == 3) || (size == 2 && opc == 2) ||
+                  (size < 2 && opc == 2);
+        o->rt = (int)(u & 31);
+        o->rn = (int)((u >> 5) & 31);
+        o->rm = (int)((u >> 16) & 31);
+        o->mem_width = size < 3 ? (1 << size) : 8;
         if (is_ldr)
             o->is_load = 1;
         else
@@ -250,8 +305,11 @@ void a64_decode(uint64_t pc, uint32_t insn, a64_insn_t *o) {
         o->rn = (int)((u >> 5) & 31);
         o->rt2 = (int)((u >> 10) & 31);
         o->imm = sext((u >> 15) & 0x7F, 7) * (o->is64 ? 8 : 4);
-        o->updates_rn = ((u & 0x7FC00000) != 0xA9000000 &&
-                         (u & 0x7FC00000) != 0x29000000) ? 1 : 0;
+        o->mem_width = o->is64 ? 8 : 4;
+        uint32_t fam = u & 0x7FC00000;
+        o->mem_mode = (fam == 0xA9800000 || fam == 0x29800000) ? 2
+                    : (fam == 0xA8800000 || fam == 0x28800000) ? 1 : 0;
+        o->updates_rn = o->mem_mode != 0;
         o->is_store = 1;
         return;
     }
@@ -264,8 +322,11 @@ void a64_decode(uint64_t pc, uint32_t insn, a64_insn_t *o) {
         o->rn = (int)((u >> 5) & 31);
         o->rt2 = (int)((u >> 10) & 31);
         o->imm = sext((u >> 15) & 0x7F, 7) * (o->is64 ? 8 : 4);
-        o->updates_rn = ((u & 0x7FC00000) != 0xA9400000 &&
-                         (u & 0x7FC00000) != 0x29400000) ? 1 : 0;
+        o->mem_width = o->is64 ? 8 : 4;
+        uint32_t fam = u & 0x7FC00000;
+        o->mem_mode = (fam == 0xA9C00000 || fam == 0x29C00000) ? 2
+                    : (fam == 0xA8C00000 || fam == 0x28C00000) ? 1 : 0;
+        o->updates_rn = o->mem_mode != 0;
         o->is_load = 1;
         return;
     }
@@ -370,6 +431,24 @@ uint32_t a64_insn_movz(int rd, uint16_t imm, int shift16, int is64) {
     uint32_t base = is64 ? 0xD2800000 : 0x52800000;
     return base | ((uint32_t)(shift16 & 3) << 21) | ((uint32_t)imm << 5) |
            (uint32_t)(rd & 31);
+}
+
+uint32_t a64_insn_movk(int rd, uint16_t imm, int shift16, int is64) {
+    uint32_t base = is64 ? 0xF2800000 : 0x72800000;
+    return base | ((uint32_t)(shift16 & 3) << 21) | ((uint32_t)imm << 5) |
+           (uint32_t)(rd & 31);
+}
+
+uint32_t a64_insn_add_reg(int rd, int rn, int rm) {
+    /* add xD, xN, xM */
+    return 0x8B000000 | ((uint32_t)(rm & 31) << 16) |
+           ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31);
+}
+
+uint32_t a64_insn_sub_reg(int rd, int rn, int rm) {
+    /* sub xD, xN, xM */
+    return 0xCB000000 | ((uint32_t)(rm & 31) << 16) |
+           ((uint32_t)(rn & 31) << 5) | (uint32_t)(rd & 31);
 }
 
 uint32_t a64_insn_add_imm(int rd, int rn, uint16_t imm, int is64) {

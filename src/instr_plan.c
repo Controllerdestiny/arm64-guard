@@ -349,28 +349,88 @@ static int collect_external_fixups(const elf64_module_t *m,
 
 /* ---------------- 保存/恢复序列 ---------------- */
 
-/* 压栈 x0-x7, 保存 NZCV 到栈;block_guard 额外压 x30 */
-static void emit_saves(em_t *e, int save_x30) {
+/*
+ * 全寄存器上下文保存:压栈 x0..x29、x30、NZCV,再开辟 64 字节 scratch 区。
+ * 布局(sp 下降 TRAMP_SAVE_BYTES):
+ *   [sp+0 ..  sp+56 )  8×8B scratch(参数恢复暂存)
+ *   [sp+64 .. sp+80 )  NZCV
+ *   [sp+80 .. sp+96 )  x30,xzr
+ *   [sp+96 .. sp+336)  x0..x29
+ * 目的:check 调用 / 参数恢复可以任意改写任何寄存器,被搬移指令重放前
+ * 恢复完整现场 → 重放指令读到的寄存器与守卫点完全一致(消除暂存污染)。
+ */
+#define TRAMP_SAVE_BYTES  336   /* 16*16 + 16(nzcv) + 64(scratch) */
+
+static void emit_save_all(em_t *e) {
     em_put(e, a64_insn_stp_pre(0, 1, 31, -16, 1));
     em_put(e, a64_insn_stp_pre(2, 3, 31, -16, 1));
     em_put(e, a64_insn_stp_pre(4, 5, 31, -16, 1));
     em_put(e, a64_insn_stp_pre(6, 7, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(8, 9, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(10, 11, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(12, 13, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(14, 15, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(16, 17, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(18, 19, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(20, 21, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(22, 23, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(24, 25, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(26, 27, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(28, 29, 31, -16, 1));
+    em_put(e, a64_insn_stp_pre(30, 31, 31, -16, 1)); /* stp x30, xzr */
     em_put(e, a64_insn_mrs_nzcv(8));
     em_put(e, a64_insn_str_pre(8, 31, -16, 1));
-    if (save_x30)
-        em_put(e, a64_insn_str_pre(30, 31, -16, 1));
+    em_put(e, a64_insn_sub_imm(31, 31, 64, 1));       /* scratch 区 */
 }
 
-/* 恢复 x0-x7 与 NZCV;save_x30 时先恢复 x30(入栈顺序的逆序) */
-static void emit_restores(em_t *e, int save_x30) {
-    if (save_x30)
-        em_put(e, a64_insn_ldp_post(30, 30, 31, 16, 1));
-    em_put(e, a64_insn_ldp_post(8, 8, 31, 16, 1));
+static void emit_restore_all(em_t *e) {
+    em_put(e, a64_insn_add_imm(31, 31, 64, 1));       /* 丢弃 scratch */
+    em_put(e, a64_insn_ldp_post(8, 8, 31, 16, 1));    /* NZCV */
     em_put(e, a64_insn_msr_nzcv(8));
+    em_put(e, a64_insn_ldp_post(30, 31, 31, 16, 1));  /* x30, xzr */
+    em_put(e, a64_insn_ldp_post(28, 29, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(26, 27, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(24, 25, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(22, 23, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(20, 21, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(18, 19, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(16, 17, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(14, 15, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(12, 13, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(10, 11, 31, 16, 1));
+    em_put(e, a64_insn_ldp_post(8, 9, 31, 16, 1));
     em_put(e, a64_insn_ldp_post(6, 7, 31, 16, 1));
     em_put(e, a64_insn_ldp_post(4, 5, 31, 16, 1));
     em_put(e, a64_insn_ldp_post(2, 3, 31, 16, 1));
     em_put(e, a64_insn_ldp_post(0, 1, 31, 16, 1));
+}
+
+/*
+ * 计算 x16 = base + off(base=31 为 sp),供槽位加载用。
+ * 基址不可能落在 x8..x17(分析已把这些基址标为不可恢复),x16 恒可用。
+ * off 支持任意大小(12 位立即数 / movz+movk 链 + 寄存器加减)。
+ */
+static void em_addr(em_t *e, int base, int64_t off) {
+    int tmp = 16; /* 分析保证 base != 16/17 */
+    if (off >= 0 && off <= 4095) {
+        em_put(e, a64_insn_add_imm(tmp, base, (uint16_t)off, 1));
+    } else if (off < 0 && -off <= 4095) {
+        em_put(e, a64_insn_sub_imm(tmp, base, (uint16_t)(-off), 1));
+    } else {
+        uint64_t a = (off < 0) ? (uint64_t)(-off) : (uint64_t)off;
+        em_put(e, a64_insn_movz(tmp, (uint16_t)(a & 0xFFFF), 0, 1));
+        em_put(e, a64_insn_movk(tmp, (uint16_t)((a >> 16) & 0xFFFF), 1, 1));
+        if (off < 0)
+            em_put(e, a64_insn_sub_reg(tmp, base, tmp));
+        else
+            em_put(e, a64_insn_add_reg(tmp, base, tmp));
+    }
+}
+
+/* 从槽位 [base, off] 加载到 xdst(base=31 为 sp,off 已含 TRAMP_SAVE_BYTES 校正) */
+static void em_slot_load(em_t *e, int dst, int base, int64_t off, int is64) {
+    em_addr(e, base, off);
+    em_put(e, a64_insn_ldr_imm(dst, 16, 0, is64));
 }
 
 /* ---------------- 规划主流程 ---------------- */
@@ -380,7 +440,7 @@ int instr_plan_guard(const elf64_module_t *m,
                      uint64_t guard_pc, int is_call_guard,
                      uint64_t block_end, uint64_t check_addr,
                      uint64_t callee_addr, uint64_t tramp_base,
-                     instr_plan_t *out) {
+                     uint64_t snap_addr, instr_plan_t *out) {
     if (!m || !out)
         return INSTR_ERR_ARG;
     if ((guard_pc & 3) || (caller_start & 3) || (caller_end & 3) ||
@@ -405,19 +465,26 @@ int instr_plan_guard(const elf64_module_t *m,
     if (cont > caller_end)
         return INSTR_ERR_RANGE;
 
-    /* 1. 参数位置分析(入口 x0~x7,实例方法时 x0=this) */
+    /* 1. 参数位置分析(入口 x0~x7,实例方法时 x0=this)。
+     *    快照模式(snap_addr != 0)跳过分析:入口 trampoline 已把 x0~x7
+     *    原样保存在快照区,守卫点直接读取 —— 100% 可恢复。 */
     a64_loc_t locs[ANALYSIS_NARGS];
     int nfound = 0;
-    if (analysis_locate_args(fetch_module, (void *)m, caller_start,
-                             caller_end, guard_pc, locs, &nfound) != 0)
-        return INSTR_ERR_NOLOC;
-    if (nfound == 0)
-        return INSTR_ERR_NOLOC;
+    if (snap_addr == 0) {
+        if (analysis_locate_args(fetch_module, (void *)m, caller_start,
+                                 caller_end, guard_pc, locs, &nfound) != 0)
+            return INSTR_ERR_NOLOC;
+        if (nfound == 0)
+            return INSTR_ERR_NOLOC;
+    } else {
+        nfound = ANALYSIS_NARGS;
+    }
 
     memset(out, 0, sizeof(*out));
     out->addr = guard_pc;
     out->is_call_guard = is_call_guard;
     out->block_end = is_call_guard ? 0 : block_end;
+    out->snap_addr = snap_addr;
 
     /* 2. 原指令(用于卸载) */
     for (int i = 0; i < plen; i++) {
@@ -426,6 +493,12 @@ int instr_plan_guard(const elf64_module_t *m,
     }
 
     /* 3. 生成 trampoline */
+    /*
+     * 保存全部现场 -> 恢复入口参数到 x0~x7(未恢复的置 0)
+     * -> 调 check -> pass 恢复现场后重放被搬移指令 / skip 直接跳块尾。
+     * 全寄存器保存/恢复保证:check 与参数恢复阶段可以任意使用暂存寄存器,
+     * 被搬移指令重放时读到的寄存器与守卫点完全一致(消除暂存污染导致的崩溃)。
+     */
     em_t e;
     e.w = out->tramp;
     e.cap = INSTR_TRAMP_MAX;
@@ -433,81 +506,57 @@ int instr_plan_guard(const elf64_module_t *m,
     e.base = tramp_base;
     e.err = 0;
 
+    /* 3a. 保存完整现场(x0..x30 + NZCV + 64B scratch) */
+    emit_save_all(&e);
+
     /*
-     * 3a. 恢复入口参数 x0~x7(未恢复的置 0),与 dobby 的替换函数一致:
-     *     实例方法时 x0 = this,x1 = 第一个显式参数,...
-     * 注意:sp 槽位必须在压栈之前读取(sp 即将变化)。
+     * 3b. 恢复入口参数(与 dobby 的替换函数一致:实例方法 x0=this, x1=实参...):
+     *   - 快照模式:从入口快照区直接读取(x0~x7 在函数入口被原样保存),
+     *     与函数内部多复杂无关,100% 可恢复;
+     *   - 数据流模式:
+     *       REG 源:先存到栈 scratch [sp, #8k](任何寄存器组合都不会互相覆盖);
+     *       SLOT 源:加载到暂存 x(8+k),支持任意基址(x0..x7/x18..x30/sp)
+     *       与任意偏移(sp 槽位偏移已含 TRAMP_SAVE_BYTES 校正);
+     *       最后统一组装 x0..x7。
      */
-    for (int k = 0; k < ANALYSIS_NARGS; k++) {
-        if (locs[k].kind == LOC_SLOT && locs[k].base_reg == 31) {
-            int64_t off = locs[k].off;
-            int sh = locs[k].is64 ? 3 : 2;
-            if (off >= 0 && (off & ((1 << sh) - 1)) == 0 &&
-                (off >> sh) <= 0xFFF) {
-                em_put(&e, a64_insn_ldr_imm(9 + k, 31, off, locs[k].is64));
-            } else if (off >= 0 && off <= 4095) {
-                em_put(&e, a64_insn_add_imm(9 + k, 31, (uint16_t)off, 1));
-                em_put(&e, a64_insn_ldr_imm(9 + k, 9 + k, 0, locs[k].is64));
-            } else if (off < 0 && -off <= 4095) {
-                em_put(&e, a64_insn_sub_imm(9 + k, 31, (uint16_t)(-off), 1));
-                em_put(&e, a64_insn_ldr_imm(9 + k, 9 + k, 0, locs[k].is64));
-            } else {
-                return INSTR_ERR_NOLOC;
-            }
+    if (snap_addr != 0) {
+        em_put_lit(&e, 9, snap_addr);
+        for (int k = 0; k < ANALYSIS_NARGS; k++)
+            em_put(&e, a64_insn_ldr_imm(k, 9, 8 * k, 1));
+    } else {
+        for (int k = 0; k < ANALYSIS_NARGS; k++) {
+            if (locs[k].kind == LOC_REG && locs[k].reg != k)
+                em_put(&e, a64_insn_str_imm(locs[k].reg, 31, 8 * k, 1));
         }
-    }
-
-    /* 3b. 保存现场 */
-    emit_saves(&e, !is_call_guard);
-
-    /* 3c. 源寄存器落在 x0..x7 的参数先进 staging(x9..x16),避免目标覆盖 */
-    for (int k = 0; k < ANALYSIS_NARGS; k++) {
-        if (locs[k].kind == LOC_REG && locs[k].reg <= 7 && locs[k].reg != k)
-            em_put(&e, a64_insn_mov_reg(9 + k, locs[k].reg, 1));
-    }
-
-    /* 3d. 装载到 x0..x7 */
-    for (int k = 0; k < ANALYSIS_NARGS; k++) {
-        if (locs[k].kind == LOC_REG) {
-            if (locs[k].reg == k)
-                continue;
-            if (locs[k].reg <= 7)
-                em_put(&e, a64_insn_mov_reg(k, 9 + k, 1));
-            else
-                em_put(&e, a64_insn_mov_reg(k, locs[k].reg, 1));
-        } else if (locs[k].kind == LOC_SLOT) {
-            if (locs[k].base_reg == 31) {
-                em_put(&e, a64_insn_mov_reg(k, 9 + k, 1));
-            } else { /* x29 槽 */
+        for (int k = 0; k < ANALYSIS_NARGS; k++) {
+            if (locs[k].kind == LOC_SLOT) {
                 int64_t off = locs[k].off;
-                int sh = locs[k].is64 ? 3 : 2;
-                if (off >= 0 && (off & ((1 << sh) - 1)) == 0 &&
-                    (off >> sh) <= 0xFFF) {
-                    em_put(&e, a64_insn_ldr_imm(k, 29, off, locs[k].is64));
-                } else if (off >= 0 && off <= 4095) {
-                    em_put(&e, a64_insn_add_imm(9 + k, 29, (uint16_t)off, 1));
-                    em_put(&e, a64_insn_ldr_imm(k, 9 + k, 0, locs[k].is64));
-                } else if (off < 0 && -off <= 4095) {
-                    em_put(&e, a64_insn_sub_imm(9 + k, 29, (uint16_t)(-off), 1));
-                    em_put(&e, a64_insn_ldr_imm(k, 9 + k, 0, locs[k].is64));
-                } else {
-                    return INSTR_ERR_NOLOC;
-                }
+                if (locs[k].base_reg == 31)
+                    off += TRAMP_SAVE_BYTES;
+                em_slot_load(&e, 8 + k, locs[k].base_reg, off, locs[k].is64);
             }
-        } else {
-            em_put(&e, a64_insn_mov_reg(k, 31, 1)); /* mov xk, xzr */
+        }
+        for (int k = 0; k < ANALYSIS_NARGS; k++) {
+            if (locs[k].kind == LOC_REG) {
+                if (locs[k].reg != k)
+                    em_put(&e, a64_insn_ldr_imm(k, 31, 8 * k, 1));
+            } else if (locs[k].kind == LOC_SLOT) {
+                em_put(&e, a64_insn_mov_reg(k, 8 + k, 1));
+            } else {
+                em_put(&e, a64_insn_mov_reg(k, 31, 1)); /* mov xk, xzr */
+            }
         }
     }
 
-    /* 3e. mycheck(入口参数...) */
+    /* 3c. mycheck(入口参数...) */
     em_put_lit(&e, 17, check_addr);
     em_put(&e, a64_insn_blr(17));
     size_t cbz_off = e.n;
     em_put(&e, 0); /* 占位:cbz w0, skip */
 
     if (is_call_guard) {
-        /* ---- pass 路径 ---- */
-        emit_restores(&e, 0);
+        /* ---- pass 路径:恢复现场(callee 实参回到 x0..x7)后执行原调用 ---- */
+        emit_restore_all(&e);
         em_put_lit(&e, 16, callee_addr);
         em_put(&e, a64_insn_blr(16));        /* 执行原调用 */
         em_put_lit(&e, 30, guard_pc + 4);    /* x30 = 调用返回地址 */
@@ -516,7 +565,7 @@ int instr_plan_guard(const elf64_module_t *m,
 
         /* ---- skip 路径 ---- */
         size_t skip_off = e.n;
-        emit_restores(&e, 0);
+        emit_restore_all(&e);
         em_put_lit(&e, 30, guard_pc + 4);    /* x30 = 如同调用刚返回 */
         /* L_after 汇合点 */
         size_t after_off = e.n;
@@ -545,7 +594,7 @@ int instr_plan_guard(const elf64_module_t *m,
     } else {
         /* ---- block-guard ---- */
         /* pass 路径:恢复现场 + 搬移块首指令 + 跳 cont */
-        emit_restores(&e, 1);
+        emit_restore_all(&e);
         size_t pass_off = e.n;
         {
             uint64_t pcs[4];
@@ -565,7 +614,7 @@ int instr_plan_guard(const elf64_module_t *m,
 
         /* skip 路径:恢复现场 + 跳块尾 */
         size_t skip_off = e.n;
-        emit_restores(&e, 1);
+        emit_restore_all(&e);
         em_put_lit(&e, 16, block_end);
         em_put(&e, a64_insn_br(16));
 
@@ -608,5 +657,91 @@ int instr_plan_guard(const elf64_module_t *m,
         memcpy(out->patch + 8, &tramp_base, 8);
     }
     out->patch_len = plen;
+    return INSTR_OK;
+}
+
+/*
+ * 规划函数入口的"参数快照"补丁(入口快照模式):
+ *
+ *   fn 入口 16 字节被改写为:
+ *     ldr x16, [pc, #8]; br x16; .quad entry_tramp
+ *   入口 trampoline(entry_tramp_base 处):
+ *     保存完整现场 -> 把 x0~x7 原样存入 snap_addr(快照区)
+ *     -> 恢复完整现场 -> 重放入口被覆盖的指令 -> 跳回 fn+16。
+ *
+ *   之后任何守卫点都能从 snap_addr 读到"函数入口"的 x0~x7 —— 与函数内部
+ *   把参数搬到哪里、多复杂完全无关,100% 可恢复(类似 dobby 的入口 hook)。
+ *
+ *   注意:入口 trampoline 每次调用都会执行,有少量性能开销;
+ *   递归/自尾部调用在守卫点之前重新进入本函数会覆盖快照(见 README 限制)。
+ */
+int instr_plan_entry_snapshot(const elf64_module_t *m,
+                              uint64_t fn, uint64_t block_end,
+                              uint64_t snap_addr, uint64_t entry_tramp_base,
+                              instr_plan_t *out) {
+    if (!m || !out || (fn & 3))
+        return INSTR_ERR_ARG;
+
+    memset(out, 0, sizeof(*out));
+    out->addr = fn;
+    out->is_call_guard = 1;
+    out->block_end = 0;
+    out->snap_addr = snap_addr;
+
+    /* 原指令(卸载用):入口 16 字节 */
+    for (int i = 0; i < 16; i++) {
+        uint32_t w = fetch_module((void *)m, fn + (uint64_t)(i & ~3));
+        out->orig[i] = (uint8_t)(w >> ((i & 3) * 8));
+    }
+
+    em_t e;
+    e.w = out->tramp;
+    e.cap = INSTR_TRAMP_MAX;
+    e.n = 0;
+    e.base = entry_tramp_base;
+    e.err = 0;
+
+    /* 保存完整现场 → 快照 x0~x7 → 恢复现场(重放指令看到与入口一致的寄存器) */
+    emit_save_all(&e);
+    em_put_lit(&e, 9, snap_addr);
+    for (int k = 0; k < ANALYSIS_NARGS; k++)
+        em_put(&e, a64_insn_str_imm(k, 9, 8 * k, 1));
+    emit_restore_all(&e);
+
+    /* 重放入口被覆盖的 4 条指令 */
+    {
+        uint64_t pcs[4];
+        uint32_t insns[4];
+        for (int k = 0; k < 4; k++) {
+            pcs[k] = fn + (uint64_t)k * 4;
+            insns[k] = fetch_module((void *)m, fn + (uint64_t)k * 4);
+        }
+        int r = plan_displaced(&e, m, insns, pcs, 4, fn, 16, out);
+        if (r)
+            return r;
+    }
+    em_put_lit(&e, 16, fn + 16);
+    em_put(&e, a64_insn_br(16));
+
+    if (e.err)
+        return INSTR_ERR_OTHER;
+    out->tramp_words = e.n;
+
+    /* 外部指向入口补丁区的分支重映射(循环回跳等) */
+    {
+        int rc = collect_external_fixups(m, fn, 0, block_end, fn, 16, out);
+        if (rc != INSTR_OK)
+            return rc;
+    }
+
+    /* 入口补丁:形态 B,固定 16 字节 */
+    {
+        uint32_t p0 = a64_insn_ldr_lit(16, 1, fn + 8, fn);
+        uint32_t p1 = a64_insn_br(16);
+        memcpy(out->patch + 0, &p0, 4);
+        memcpy(out->patch + 4, &p1, 4);
+        memcpy(out->patch + 8, &entry_tramp_base, 8);
+    }
+    out->patch_len = 16;
     return INSTR_OK;
 }

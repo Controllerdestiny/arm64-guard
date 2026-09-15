@@ -22,6 +22,7 @@ Write-Host "== 1. cross-compile ARM64 target .so (NDK) =="
 & $CC -O2 -fPIC -shared                       demo/libtarget.c       -o build/target_o2.so
 & $CC -O0 -fPIC -shared -fno-omit-frame-pointer demo/libtarget_block.c -o build/target_block.so
 & $CC -O0 -fPIC -shared -fno-omit-frame-pointer demo/libtarget_block.c -o build/libtarget_block.so
+& $CC -O0 -fPIC -shared -fno-omit-frame-pointer demo/libtarget_complex.c -o build/libtarget_complex.so
 $CXX = "$TC\aarch64-linux-android24-clang++.cmd"
 & $CXX -O0 -fPIC -shared -fno-omit-frame-pointer demo/libtarget_cpp.cpp -o build/libtarget_cpp.so
 & $CC -O2 -fPIC -shared demo/libcheck.c -o build/libcheck.so
@@ -36,5 +37,9 @@ Write-Host "== 3. build host logic test (zig) =="
 if ($LASTEXITCODE -ne 0) { throw "zig build failed" }
 
 Write-Host "== 4. run host logic test =="
-& ".\build\test_logic.exe" ".\build\target_o0.so" ".\build\target_block.so" ".\build\plan_dump.txt"
+& ".\build\test_logic.exe" ".\build\target_o0.so" ".\build\target_block.so" ".\build\plan_dump.txt" "main" ".\build\libtarget_complex.so"
+Write-Host "exit: $LASTEXITCODE"
+
+Write-Host "== 5. C++ 实例方法逻辑测试 =="
+& ".\build\test_logic.exe" ".\build\libtarget_cpp.so" ".\build\libtarget_cpp.so" ".\build\plan_dump_cpp.txt" "_ZN3Foo4workEi"
 Write-Host "exit: $LASTEXITCODE"

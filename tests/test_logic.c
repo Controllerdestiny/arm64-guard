@@ -37,7 +37,304 @@ static void chk(int cond, const char *name) {
     }
 }
 
-/* ---------------- a64 自检 ---------------- */
+/* ---------------- 解码语料(NDK clang 汇编所得,ground truth) ---------------- */
+
+typedef struct {
+    uint32_t w;
+    a64_kind_t kind;
+    int rd, rn, rm, rt, rt2;
+    int is64;
+    int64_t imm;
+    int mem_mode, mem_width;
+    int is_load, is_store;
+} corpus_case_t;
+
+static void test_decode_corpus(void) {
+    printf("== a64 解码语料校验(与 NDK clang 编码逐一对照) ==\n");
+    corpus_case_t cases[] = {
+        /* stur/ldur 家族(imm9) */
+        { 0xF80083E0, A64_STUR, -1, 31, -1, 0, -1, 1, 8, 0, 8, 0, 1 },
+        { 0xB81FC3E1, A64_STUR, -1, 31, -1, 1, -1, 0, -4, 0, 4, 0, 1 },
+        { 0xF84103E2, A64_LDUR, -1, 31, -1, 2, -1, 1, 16, 0, 8, 1, 0 },
+        { 0xB85F83E3, A64_LDUR, -1, 31, -1, 3, -1, 0, -8, 0, 4, 1, 0 },
+        { 0x380013E4, A64_STUR, -1, 31, -1, 4, -1, 0, 1, 0, 1, 0, 1 },
+        { 0x780023E5, A64_STUR, -1, 31, -1, 5, -1, 0, 2, 0, 2, 0, 1 },
+        { 0x384033E6, A64_LDUR, -1, 31, -1, 6, -1, 0, 3, 0, 1, 1, 0 },
+        { 0x784043E7, A64_LDUR, -1, 31, -1, 7, -1, 0, 4, 0, 2, 1, 0 },
+        { 0x38C053E8, A64_LDUR, -1, 31, -1, 8, -1, 0, 5, 0, 1, 1, 0 },
+        { 0xB88183E9, A64_LDUR, -1, 31, -1, 9, -1, 1, 24, 0, 4, 1, 0 },
+        /* pre/post 索引 */
+        { 0xF81F0FE0, A64_STUR, -1, 31, -1, 0, -1, 1, -16, 3, 8, 0, 1 },
+        { 0xF84107E1, A64_LDUR, -1, 31, -1, 1, -1, 1, 16, 1, 8, 1, 0 },
+        { 0xB8008FA2, A64_STUR, -1, 29, -1, 2, -1, 0, 8, 3, 4, 0, 1 },
+        { 0xB84047A3, A64_LDUR, -1, 29, -1, 3, -1, 0, 4, 1, 4, 1, 0 },
+        /* stp/ldp */
+        { 0xA9BF07E0, A64_STP, -1, 31, -1, 0, 1, 1, -16, 2, 8, 0, 1 },
+        { 0xA8C10FE2, A64_LDP, -1, 31, -1, 2, 3, 1, 16, 1, 8, 1, 0 },
+        { 0xA9BF7BFD, A64_STP, -1, 31, -1, 29, 30, 1, -16, 2, 8, 0, 1 },
+        { 0xA8C17BFD, A64_LDP, -1, 31, -1, 29, 30, 1, 16, 1, 8, 1, 0 },
+        /* 字节/半字 imm12 */
+        { 0x390017E4, A64_STR_BH, -1, 31, -1, 4, -1, 0, 5, 0, 1, 0, 1 },
+        { 0x39401BE5, A64_LDR_BH, -1, 31, -1, 5, -1, 0, 6, 0, 1, 1, 0 },
+        { 0x790013E6, A64_STR_BH, -1, 31, -1, 6, -1, 0, 8, 0, 2, 0, 1 },
+        { 0x794017E7, A64_LDR_BH, -1, 31, -1, 7, -1, 0, 10, 0, 2, 1, 0 },
+        { 0x39C033E8, A64_LDR_BH, -1, 31, -1, 8, -1, 0, 12, 0, 1, 1, 0 },
+        { 0x79C01FE9, A64_LDR_BH, -1, 31, -1, 9, -1, 0, 14, 0, 2, 1, 0 },
+        /* 寄存器偏移 */
+        { 0xF8226820, A64_LDSTR_REG, -1, 1, 2, 0, -1, 1, 0, 0, 8, 0, 1 },
+        { 0xF8656883, A64_LDSTR_REG, -1, 4, 5, 3, -1, 1, 0, 0, 8, 1, 0 },
+        { 0xB86868E6, A64_LDSTR_REG, -1, 7, 8, 6, -1, 0, 0, 0, 4, 1, 0 },
+        { 0x382B6949, A64_LDSTR_REG, -1, 10, 11, 9, -1, 0, 0, 0, 1, 0, 1 },
+        { 0x386E69AC, A64_LDSTR_REG, -1, 13, 14, 12, -1, 0, 0, 0, 1, 1, 0 },
+        { 0xB8B16A0F, A64_LDSTR_REG, -1, 16, 17, 15, -1, 1, 0, 0, 4, 1, 0 },
+        /* mov 别名(反向操作数形式) */
+        { 0xAA0103E0, A64_MOV_REG, 0, -1, 1, -1, -1, 1, 0, 0, 0, 0, 0 },
+        { 0xAA1F03E2, A64_MOV_REG, 2, -1, 31, -1, -1, 1, 0, 0, 0, 0, 0 },
+        { 0xAA1F0083, A64_MOV_REG, 3, -1, 4, -1, -1, 1, 0, 0, 0, 0, 0 },
+        { 0x2A0603E5, A64_MOV_REG, 5, -1, 6, -1, -1, 0, 0, 0, 0, 0, 0 },
+        /* 其它写 Rd(保守) */
+        { 0xD37DF020, A64_OTHER, 0, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0 },
+        { 0x9A840062, A64_OTHER, 2, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0 },
+        { 0x8B0700C5, A64_OTHER, 5, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0 },
+        { 0xCB0A0128, A64_OTHER, 8, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0 },
+        { 0x9B010811, A64_OTHER, 17, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0 },
+        { 0x93407C83, A64_OTHER, 3, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0 },
+        { 0xB1001420, A64_OTHER, 0, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0 },
+        { 0xEB03005F, A64_OTHER, 31, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0 },
+        /* 大偏移 ldr */
+        { 0xF9480FE1, A64_LDR_IMM, -1, 31, -1, 1, -1, 1, 4120, 0, 8, 1, 0 },
+    };
+    int fails = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        corpus_case_t *cc = &cases[i];
+        a64_insn_t d;
+        a64_decode(0x1000 + (uint64_t)i * 4, cc->w, &d);
+        int ok = d.kind == cc->kind && d.rd == cc->rd && d.rn == cc->rn &&
+                 d.rm == cc->rm && d.rt == cc->rt && d.rt2 == cc->rt2 &&
+                 d.is64 == cc->is64 && d.imm == cc->imm &&
+                 d.mem_mode == cc->mem_mode && d.mem_width == cc->mem_width &&
+                 d.is_load == cc->is_load && d.is_store == cc->is_store;
+        if (!ok) {
+            fails++;
+            printf("  [FAIL] %08x: kind=%d(exp %d) rd=%d(exp %d) rn=%d(exp %d) "
+                   "rm=%d(exp %d) rt=%d(exp %d) rt2=%d(exp %d) is64=%d(exp %d) "
+                   "imm=%lld(exp %lld) mode=%d(exp %d) width=%d(exp %d) "
+                   "load=%d(exp %d) store=%d(exp %d)\n",
+                   cc->w, (int)d.kind, (int)cc->kind, d.rd, cc->rd, d.rn, cc->rn,
+                   d.rm, cc->rm, d.rt, cc->rt, d.rt2, cc->rt2, d.is64, cc->is64,
+                   (long long)d.imm, (long long)cc->imm, d.mem_mode,
+                   cc->mem_mode, d.mem_width, cc->mem_width, d.is_load,
+                   cc->is_load, d.is_store, cc->is_store);
+        }
+    }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "解码语料 %zu 条全部一致",
+             sizeof(cases) / sizeof(cases[0]));
+    chk(fails == 0, buf);
+    if (fails) {
+        g_fail = 1;
+    }
+}
+
+/* ---------------- 数据流分析单元测试 ---------------- */
+
+typedef struct {
+    const uint32_t *words;
+    size_t n;
+} ram_t;
+
+static uint32_t fetch_ram(void *ctx, uint64_t addr) {
+    ram_t *r = (ram_t *)ctx;
+    if (addr < 0x1000)
+        return 0;
+    uint64_t idx = (addr - 0x1000) / 4;
+    if (idx >= r->n)
+        return 0;
+    return r->words[idx];
+}
+
+/* 在合成指令序列 [words, n) 的 guard 索引处做多参数分析 */
+static int locate_ram(const uint32_t *words, size_t n, size_t guard_idx,
+                      a64_loc_t *locs, int *nfound) {
+    ram_t r = { words, n };
+    return analysis_locate_args(fetch_ram, &r, 0x1000,
+                                0x1000 + (uint64_t)n * 4,
+                                0x1000 + (uint64_t)guard_idx * 4, locs,
+                                nfound);
+}
+
+static void test_analysis_flow(void) {
+    printf("== 数据流分析单元测试(复杂指令序列) ==\n");
+
+    /* 1. pre-index 压栈 + 从新 sp 读回 + 杀 x0 */
+    {
+        uint32_t w[] = {
+            a64_insn_str_pre(0, 31, -16, 1),   /* str x0, [sp, #-16]! */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr          */
+            a64_insn_ldr_imm(1, 31, 0, 1),     /* ldr x1, [sp, #0]     */
+            a64_insn_nop(),                    /* 守卫点:x0 已死,x1=arg0 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 4, 3, locs, &nf);
+        chk(rc == 0 && nf >= 1, "pre-index 压栈后从 [sp,#0] 读回(arg0 存活)");
+        chk(locs[0].kind == LOC_REG && locs[0].reg == 1,
+            "pre-index 场景 arg0 位于 x1");
+    }
+
+    /* 2. post-index 压栈 + 从 [sp,#-16] 读回 */
+    {
+        uint32_t s2[] = {
+            0xF80107E0,                        /* str x0, [sp], #16 */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr          */
+            0xF85F03E1,                        /* ldur x1, [sp, #-16]  */
+            a64_insn_nop(),                    /* 守卫点 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(s2, 4, 3, locs, &nf);
+        chk(rc == 0 && nf >= 1, "post-index 压栈后从 [sp,#-16] 读回(arg0 存活)");
+        chk(locs[0].kind == LOC_REG && locs[0].reg == 1,
+            "post-index 场景 arg0 位于 x1");
+    }
+
+    /* 3. 字节存储不登记槽位:strb 后 ldr 读不到参数 */
+    {
+        uint32_t w[] = {
+            0x390023E0,                        /* strb w0, [sp, #8] */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr        */
+            a64_insn_ldr_imm(1, 31, 8, 1),     /* ldr x1, [sp, #8]   */
+            a64_insn_nop(),                    /* 守卫点 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 4, 3, locs, &nf);
+        chk(rc == 0, "字节存储场景分析成功");
+        chk(locs[0].kind == LOC_UNKNOWN,
+            "strb 部分宽度存储后 arg0 不可恢复(不产生假槽位)");
+    }
+
+    /* 4. callee-saved 基址槽:x19 基址可用 */
+    {
+        uint32_t w[] = {
+            a64_insn_str_imm(0, 19, 8, 1),     /* str x0, [x19, #8] */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr        */
+            a64_insn_nop(),                    /* 守卫点 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 3, 2, locs, &nf);
+        chk(rc == 0 && nf >= 1, "x19 基址槽位可恢复");
+        chk(locs[0].kind == LOC_SLOT && locs[0].base_reg == 19 &&
+                locs[0].off == 8,
+            "x19 槽位 [x19, #8] 被正确报告");
+    }
+
+    /* 5. 基址寄存器被改写 -> 槽位必须失效(旧实现会报告错误槽位) */
+    {
+        uint32_t w[] = {
+            a64_insn_mov_reg(19, 0, 1),        /* mov x19, x0 */
+            a64_insn_str_imm(0, 19, 8, 1),     /* str x0, [x19, #8] */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr        */
+            a64_insn_add_imm(19, 19, 16, 1),   /* add x19, x19, #16  */
+            a64_insn_nop(),                    /* 守卫点:基址已改写 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 5, 4, locs, &nf);
+        chk(rc == 0, "基址改写场景分析成功");
+        chk(locs[0].kind == LOC_UNKNOWN,
+            "x19 被改写后其槽位失效(arg0 不可恢复,而非错误位置)");
+    }
+
+    /* 6. bl 保留 callee-saved 槽位 */
+    {
+        uint32_t w[] = {
+            a64_insn_mov_reg(19, 0, 1),        /* mov x19, x0 */
+            a64_insn_bl(0x5000000, 0x1008),    /* bl 远处 */
+            a64_insn_str_imm(19, 31, 8, 1),    /* str x19, [sp, #8] */
+            a64_insn_ldr_imm(0, 31, 8, 1),     /* ldr x0, [sp, #8]  */
+            a64_insn_nop(),                    /* 守卫点 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 5, 4, locs, &nf);
+        chk(rc == 0 && nf >= 1, "bl 后 callee-saved 槽位链仍存活");
+        chk(locs[0].kind == LOC_REG && locs[0].reg == 0,
+            "bl 后 arg0 经 x19 压栈读回 x0");
+    }
+
+    /* 7. add x29, sp, #0 后经 x29 压栈 */
+    {
+        uint32_t w[] = {
+            a64_insn_add_imm(29, 31, 0, 1),    /* add x29, sp, #0 */
+            a64_insn_str_imm(0, 29, -8, 1),    /* stur x0, [x29, #-8] */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr        */
+            a64_insn_nop(),                    /* 守卫点 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 4, 3, locs, &nf);
+        chk(rc == 0 && nf >= 1, "x29 帧基换算后槽位可恢复");
+        chk(locs[0].kind == LOC_SLOT && locs[0].base_reg == 29 &&
+                locs[0].off == -8,
+            "arg0 位于 [x29, #-8]");
+    }
+
+    /* 8. 大栈帧偏移(>4095) */
+    {
+        uint32_t w[] = {
+            a64_insn_sub_imm(31, 31, 4120, 1), /* sub sp, sp, #4120 */
+            a64_insn_str_imm(0, 31, 4120, 1),  /* str x0, [sp, #4120] */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr        */
+            a64_insn_nop(),                    /* 守卫点 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 4, 3, locs, &nf);
+        chk(rc == 0 && nf >= 1, "大帧偏移槽位可恢复");
+        chk(locs[0].kind == LOC_SLOT && locs[0].base_reg == 31 &&
+                locs[0].off == 4120,
+            "arg0 位于 [sp, #4120]");
+    }
+
+    /* 9. ldr 字面量必须杀 rt(旧实现漏杀 → 错误位置) */
+    {
+        uint32_t w[] = {
+            a64_insn_mov_reg(9, 0, 1),         /* mov x9, x0 */
+            a64_insn_ldr_lit(9, 1, 0x2000, 0x1004), /* ldr x9, [pc, #8] */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr        */
+            a64_insn_nop(),                    /* 守卫点 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 4, 3, locs, &nf);
+        chk(rc == 0, "ldr 字面量场景分析成功");
+        chk(locs[0].kind == LOC_UNKNOWN,
+            "ldr 字面量后 x9 被杀,arg0 不可恢复");
+    }
+
+    /* 10. REG 源与 SLOT 源混合(暂存不互相污染):arg0=槽,arg1=x9 */
+    {
+        uint32_t w[] = {
+            a64_insn_str_imm(0, 31, 8, 1),     /* str x0, [sp, #8]  -> arg0 槽 */
+            a64_insn_mov_reg(9, 1, 1),         /* mov x9, x1        -> arg1 x9 */
+            a64_insn_mov_reg(0, 31, 1),        /* mov x0, xzr */
+            a64_insn_mov_reg(1, 31, 1),        /* mov x1, xzr */
+            a64_insn_nop(),                    /* 守卫点 */
+        };
+        a64_loc_t locs[ANALYSIS_NARGS];
+        int nf = 0;
+        int rc = locate_ram(w, 5, 4, locs, &nf);
+        chk(rc == 0 && nf >= 2, "混合暂存场景两参数均可恢复");
+        chk(locs[0].kind == LOC_SLOT && locs[0].base_reg == 31 &&
+                locs[0].off == 8,
+            "arg0 位于 [sp, #8]");
+        chk(locs[1].kind == LOC_REG && locs[1].reg == 9,
+            "arg1 位于 x9");
+    }
+}
+
 
 static void test_a64_self(void) {
     printf("== a64 编码/解码自检 ==\n");
@@ -284,7 +581,7 @@ static int test_target(const char *path, const char *tag, int want_block,
         /* 规划 block-guard */
         instr_plan_t plan;
         rc = instr_plan_guard(&m, main_va, main_end, bstart, 0, bend,
-                              CHECK_ADDR, 0, TRAMP_BASE, &plan);
+                              CHECK_ADDR, 0, TRAMP_BASE, 0, &plan);
         printf("plan(block) rc=%d patch_len=%d tramp_words=%zu\n", rc,
                plan.patch_len, plan.tramp_words);
         if (rc == INSTR_OK) {
@@ -303,6 +600,44 @@ static int test_target(const char *path, const char *tag, int want_block,
             for (size_t i = 0; i < plan.tramp_words; i++)
                 fprintf(dump, "%08x", plan.tramp[i]);
             fprintf(dump, "\n");
+        }
+
+        /* 入口快照补丁规划(供 verify_snap.py 端到端验证) */
+        {
+            instr_plan_t ep;
+            rc = instr_plan_entry_snapshot(&m, main_va, bend,
+                                           TRAMP_BASE + 0x1000,
+                                           TRAMP_BASE + 0x2000, &ep);
+            printf("plan(entry snap) rc=%d patch_len=%d tramp_words=%zu\n", rc,
+                   ep.patch_len, ep.tramp_words);
+            if (rc == INSTR_OK) {
+                fprintf(dump, "PLAN %s entry %016llx %d ", tag,
+                        (unsigned long long)main_va, ep.patch_len);
+                dump_hex(dump, ep.patch, (size_t)ep.patch_len);
+                fprintf(dump, " %zu ", ep.tramp_words);
+                for (size_t i = 0; i < ep.tramp_words; i++)
+                    fprintf(dump, "%08x", ep.tramp[i]);
+                fprintf(dump, "\n");
+            }
+        }
+
+        /* 快照模式守卫规划(跳过数据流分析,参数从快照区读) */
+        {
+            instr_plan_t sp;
+            rc = instr_plan_guard(&m, main_va, main_end, bstart, 0, bend,
+                                  CHECK_ADDR, 0, TRAMP_BASE,
+                                  TRAMP_BASE + 0x1000, &sp);
+            printf("plan(block snap) rc=%d patch_len=%d tramp_words=%zu\n",
+                   rc, sp.patch_len, sp.tramp_words);
+            if (rc == INSTR_OK) {
+                fprintf(dump, "PLAN %s snapsnap %016llx %d ", tag,
+                        (unsigned long long)bstart, sp.patch_len);
+                dump_hex(dump, sp.patch, (size_t)sp.patch_len);
+                fprintf(dump, " %zu ", sp.tramp_words);
+                for (size_t i = 0; i < sp.tramp_words; i++)
+                    fprintf(dump, "%08x", sp.tramp[i]);
+                fprintf(dump, "\n");
+            }
         }
     } else {
         /* 调用点 */
@@ -335,7 +670,8 @@ static int test_target(const char *path, const char *tag, int want_block,
             /* 规划 call-guard */
             instr_plan_t plan;
             rc = instr_plan_guard(&m, main_va, main_end, sites[i], 1, 0,
-                                  CHECK_ADDR, CALLEE_ADDR, TRAMP_BASE, &plan);
+                                  CHECK_ADDR, CALLEE_ADDR, TRAMP_BASE, 0,
+                                  &plan);
             printf("plan(site %d) rc=%d patch_len=%d tramp_words=%zu\n", i, rc,
                    plan.patch_len, plan.tramp_words);
             if (rc == INSTR_OK) {
@@ -370,6 +706,8 @@ int main(int argc, char **argv) {
     }
     const char *block_sym = argc > 4 ? argv[4] : "main";
     test_a64_self();
+    test_decode_corpus();
+    test_analysis_flow();
 
     FILE *dump = fopen(argv[3], "w");
     if (!dump) {
@@ -379,6 +717,8 @@ int main(int argc, char **argv) {
     fprintf(dump, "VER 1\n");
     test_target(argv[1], "call", 0, "main", dump);
     test_target(argv[2], "block", 1, block_sym, dump);
+    if (argc > 5)
+        test_target(argv[5], "complex", 1, "complex_fn", dump);
     fclose(dump);
 
     printf("== %s ==\n", g_fail ? "SOME TESTS FAILED" : "ALL HOST LOGIC OK");

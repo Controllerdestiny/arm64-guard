@@ -71,6 +71,20 @@ const char *instr_last_error(void);
 int instr_guard_block(void *fn, void *block_start, void *block_end,
                       void *check);
 
+/*
+ * 入口快照模式(可选,dobby 级万能):与 instr_guard_block 相同,
+ * 但额外在 fn 入口打一个 16 字节快照补丁,把入口的 x0~x7 原样存入专用
+ * 快照区;守卫点的 check **100% 收到函数入口的 x0~x7** —— 与函数内部把
+ * 参数搬到哪里、指令多复杂、数据流是否可分析完全无关。
+ *
+ * 代价:fn 入口被修改(入口 16 字节搬到 trampoline,指令级等价),且每次
+ * 调用该函数都会多执行一次保存/恢复;要求 block_start >= fn + 16。
+ * 限制:守卫点到达前若同一函数被递归/自调用重新进入,快照会被内层覆盖
+ * (罕见;普通单层调用不受影响)。同一函数只支持安装一个快照守卫。
+ */
+int instr_guard_block_snap(void *fn, void *block_start, void *block_end,
+                           void *check);
+
 /* 卸载:把原指令写回、释放 trampoline。传 block_start。 */
 int instr_unpatch(void *patched_addr);
 
