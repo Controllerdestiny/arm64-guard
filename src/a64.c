@@ -605,8 +605,8 @@ int a64_relocate_displaced(uint64_t old_pc, uint32_t insn, uint64_t new_pc,
         return 1;
     }
     case A64_CBZ: {
-        int cbnz = ((insn & 0x7E000000) == 0x35000000 ||
-                    (insn & 0x7E000000) == 0xB5000000);
+        /* cbnz/cbz 由 bit24 区分(掩码 0x7E000000 会清掉 bit24,不可用!) */
+        int cbnz = (insn & 0x01000000) != 0;
         uint32_t e = cbnz ? a64_insn_cbnz(d.rt, d.is64, d.target, new_pc)
                           : a64_insn_cbz(d.rt, d.is64, d.target, new_pc);
         if (!e)
@@ -615,8 +615,8 @@ int a64_relocate_displaced(uint64_t old_pc, uint32_t insn, uint64_t new_pc,
         return 1;
     }
     case A64_TBZ: {
-        int tbnz = ((insn & 0x7E000000) == 0x37000000 ||
-                    (insn & 0x7E000000) == 0xB7000000);
+        /* tbnz/tbz 由 bit24 区分(掩码 0x7E000000 会清掉 bit24,不可用!) */
+        int tbnz = (insn & 0x01000000) != 0;
         uint32_t e = a64_insn_tbz(d.rt, (int)d.imm, d.is64, d.target, new_pc);
         if (tbnz)
             e ^= 0x01000000; /* tbz <-> tbnz 互转 */

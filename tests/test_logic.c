@@ -606,7 +606,7 @@ static int test_target(const char *path, const char *tag, int want_block,
             instr_plan_t ep;
             rc = instr_plan_entry_snapshot(&m, main_va, bend,
                                            TRAMP_BASE + 0x1000,
-                                           TRAMP_BASE + 0x2000, 0, &ep);
+                                           TRAMP_BASE + 0x2000, 0, 0, &ep);
             printf("plan(entry snap) rc=%d patch_len=%d tramp_words=%zu\n", rc,
                    ep.patch_len, ep.tramp_words);
             if (rc == INSTR_OK) {
@@ -627,7 +627,7 @@ static int test_target(const char *path, const char *tag, int want_block,
             rc = instr_plan_entry_snapshot(&m, main_va, bend,
                                            TRAMP_BASE + 0x1000,
                                            TRAMP_BASE + 0x2000,
-                                           TRAMP_BASE + 0x3000, &ep);
+                                           TRAMP_BASE + 0x3000, 16, &ep);
             printf("plan(entry snap chained) rc=%d patch_len=%d "
                    "tramp_words=%zu\n", rc, ep.patch_len, ep.tramp_words);
             if (rc == INSTR_OK) {

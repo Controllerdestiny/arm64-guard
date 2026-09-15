@@ -99,6 +99,56 @@ static int apply_bytes(void *addr, const uint8_t *bytes, size_t len) {
 }
 
 /*
+ * 在 near_addr ± range 内找一块 size 对齐的空闲区并 MAP_FIXED 放置。
+ * 解析 /proc/self/maps 计算空洞,选择最靠近 near_addr 的可用区间,
+ * 保证入口/块补丁的 PC 相对短跳(adrp ±4GB / b ±128MB)可达。
+ * 返回映射地址;找不到返回 NULL(调用方回退通用 mmap)。
+ */
+static uint8_t *mmap_near(uint64_t near_addr, size_t size, uint64_t range) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f)
+        return NULL;
+    uint64_t lo = near_addr > range ? near_addr - range : 0x1000;
+    uint64_t hi = near_addr + range;
+    uint64_t prev_end = 0;
+    uint64_t best = 0, best_dist = UINT64_MAX;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long a = 0, b = 0;
+        if (sscanf(line, "%lx-%lx", &a, &b) != 2)
+            continue;
+        uint64_t ms = (uint64_t)a, me = (uint64_t)b;
+        if (ms >= hi) /* 之后的区间都在上界之外,停止 */
+            break;
+        if (me < lo) {
+            prev_end = me;
+            continue;
+        }
+        /* 空闲区间 [prev_end, ms) ∩ [lo, hi) */
+        uint64_t gap_s = prev_end > lo ? prev_end : lo;
+        uint64_t gap_e = ms < hi ? ms : hi;
+        if (gap_s < gap_e) {
+            uint64_t aligned = (gap_s + 0xFFF) & ~(uint64_t)0xFFF;
+            if (aligned + size <= gap_e) {
+                uint64_t dist = aligned > near_addr ? aligned - near_addr
+                                                    : near_addr - aligned;
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best = aligned;
+                }
+            }
+        }
+        prev_end = me;
+    }
+    fclose(f);
+    if (!best)
+        return NULL;
+    void *p = mmap((void *)(uintptr_t)best, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    return p == MAP_FAILED ? NULL : (uint8_t *)p;
+}
+
+/*
  * 安全取指:先做边界检查再 memcpy,杜绝读未映射内存导致 SIGSEGV。
  * 边界由 elf64_module_init 通过 PT_LOAD 推导(size>0);地址 < base 一律拒绝。
  */
@@ -151,9 +201,10 @@ static uint64_t scan_fn_end(const elf64_module_t *m, uint64_t va) {
 static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
                       uint64_t guard, int is_call_guard, uint64_t block_end,
                       uint64_t check, uint64_t callee, int snap_mode,
-                      uint64_t prev_hook) {
+                      uint64_t prev_hook, int prev_hook_len,
+                      uint64_t reuse_snap) {
     instr_plan_t plan;
-    instr_plan_t ep; /* 入口快照计划(仅 snap_mode 使用) */
+    instr_plan_t ep; /* 入口快照计划(仅 snap_mode 且首次安装时使用) */
     int rc;
 
     /* 预规划(基址未知):校验参数与分析是否可行 */
@@ -168,27 +219,51 @@ static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
         set_err("empty trampoline");
         return INSTR_ERR_OTHER;
     }
-    if (snap_mode) {
+    if (snap_mode && reuse_snap == 0) {
+        /*
+         * 预规划:入口 trampoline 基址未知(占位 0x1000/0x2000),链式
+         * 补丁的短跳可达性(adrp ±4GB / b ±128MB)无法在此判定 ——
+         * 传 prev_hook_len=0 跳过补丁形态选择(按 16B 形态 B 只做可行性
+         * 校验);真实基址下的补丁形态选择在下方 re-plan 中进行。
+         */
         rc = instr_plan_entry_snapshot(m, cstart, block_end, 0x1000, 0x2000,
-                                       prev_hook, &ep);
+                                       prev_hook, 0, &ep);
         if (rc != INSTR_OK) {
             set_err("entry snapshot plan failed: %d", rc);
             return rc;
         }
     }
 
-    size_t pages = snap_mode ? 2 : 1;
-    uint8_t *tramp = mmap(NULL, TRAMP_PAGE * pages,
-                          PROT_READ | PROT_WRITE | PROT_EXEC,
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    size_t pages = (snap_mode && reuse_snap == 0) ? 2 : 1;
+    size_t tsize = TRAMP_PAGE * pages;
+    uint8_t *tramp = NULL;
+    if (snap_mode && prev_hook != 0 && reuse_snap == 0) {
+        /*
+         * 链式共存:入口补丁必须是短跳(12B adrp/add/br ±4GB,或 4B b
+         * ±128MB)以保留 fn[prev_hook_len..16) 原始指令给 Dobby 的 T_D
+         * 跳回;且补丁区内回跳 fixup 是单条直接跳转(±128MB)到重入序列,
+         * 因此 trampoline 必须落在 ±128MB 内。通用 mmap(NULL) 常落在
+         * 距离目标函数 >4GB 的匿名区 → 不可达。
+         * 优先在 fn 附近 ±128MB 分配;放宽 ±4GB(仅 adrp 可达)兜底。
+         */
+        tramp = mmap_near(cstart, tsize, 0x8000000ULL /* 128MB */);
+        if (!tramp)
+            tramp = mmap_near(cstart, tsize, 0x100000000ULL /* 4GB */);
+    }
+    if (!tramp) {
+        tramp = mmap(NULL, tsize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     if (tramp == MAP_FAILED) {
         set_err("mmap trampoline failed");
         return INSTR_ERR_MMAP;
     }
 
-    /* 快照区与入口 trampoline 放在第 2 页 */
+    /* 快照区与入口 trampoline 放在第 2 页;复用模式直接使用既有快照区 */
     uint64_t snap = 0, entry_base = 0;
-    if (snap_mode) {
+    if (reuse_snap != 0) {
+        snap = reuse_snap;
+    } else if (snap_mode) {
         entry_base = (uint64_t)(uintptr_t)tramp + TRAMP_PAGE;
         snap = entry_base + 0x200; /* 入口 trampoline 之后,页内互不重叠 */
     }
@@ -219,10 +294,11 @@ static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
                     plan.fixes[i].orig_insn, plan.fixes[i].new_insn);
     }
 
-    /* ---- 入口快照补丁:先应用(守卫补丁与它互不重叠) ---- */
-    if (snap_mode) {
+    /* ---- 入口快照补丁:先应用(仅首次安装;复用模式入口已装好) ---- */
+    if (snap_mode && reuse_snap == 0) {
         rc = instr_plan_entry_snapshot(m, cstart, block_end, snap,
-                                       entry_base, prev_hook, &ep);
+                                       entry_base, prev_hook, prev_hook_len,
+                                       &ep);
         if (rc != INSTR_OK) {
             set_err("entry snapshot re-plan failed: %d", rc);
             munmap(tramp, TRAMP_PAGE * pages);
@@ -293,7 +369,7 @@ static int apply_plan(const elf64_module_t *m, uint64_t cstart, uint64_t cend,
     }
     return patch_register(guard, plan.orig, plan.patch_len, tramp,
                           TRAMP_PAGE * pages, plan.fixes, plan.fix_count,
-                          snap_mode ? 2 : 1);
+                          (snap_mode && reuse_snap == 0) ? 2 : 1);
 }
 
 /* ---------------- 公共 API ---------------- */
@@ -342,10 +418,16 @@ static int init_module(elf64_module_t *m, void *fbase, const char *fname,
 /*
  * 快照模式安装前的"入口占用检测":
  *   - 有磁盘镜像:逐字节对比运行时入口 16 字节与镜像 —— 不一致即被占用;
- *   - 无镜像:启发式识别绝对跳转补丁形态(ldr x16,[pc,#8]; br x16,
- *     与 Dobby/本库的形态 B 一致)。
- * 返回 1 = 入口已被占用(拒绝安装),0 = 空闲。
+ *   - 无镜像:启发式识别 hook 补丁形态(与 Dobby 兼容):
+ *       形态 B(16B):ldr x<reg>, [pc, #8]; br x<reg>   (reg ∈ {x16, x17})
+ *       形态 A(12B):adrp x<reg>; add x<reg>,x<reg>,#lo; br x<reg>
+ *       形态 C(4B) :单条 b <target>
+ * 返回 1 = 入口已被占用(进入链式共存),0 = 空闲。
  */
+static int is_ip_reg(int r) {
+    return r == 16 || r == 17; /* IP0/IP1:hook 框架惯用的两块暂存寄存器 */
+}
+
 static int entry_busy(const elf64_module_t *m, uint64_t fn) {
     if (m->image && m->image != m->base) {
         const uint8_t *live = (const uint8_t *)(uintptr_t)fn;
@@ -358,19 +440,6 @@ static int entry_busy(const elf64_module_t *m, uint64_t fn) {
         }
         return 0;
     }
-    uint32_t w0, w1;
-    memcpy(&w0, (void *)(uintptr_t)fn, 4);
-    memcpy(&w1, (void *)(uintptr_t)fn + 4, 4);
-    return w0 == a64_insn_ldr_lit(16, 1, fn + 8, fn) && w1 == a64_insn_br(16);
-}
-
-/*
- * 解析入口上现有 hook 的跳转目标(链式共存用):
- *   - 形态 B:ldr x16, [pc, #8]; br x16; .quad target —— 从运行时读 .quad;
- *   - 形态 A:adrp x16, page; add x16, x16, #lo12; br x16 —— 解码计算。
- * 返回 hook trampoline 地址;无法识别返回 0(调用方应拒绝,避免覆盖)。
- */
-static uint64_t parse_prev_hook(uint64_t fn) {
     uint32_t w0, w1, w2;
     memcpy(&w0, (void *)(uintptr_t)fn, 4);
     memcpy(&w1, (void *)(uintptr_t)fn + 4, 4);
@@ -379,15 +448,63 @@ static uint64_t parse_prev_hook(uint64_t fn) {
     a64_decode(fn, w0, &d0);
     a64_decode(fn + 4, w1, &d1);
     a64_decode(fn + 8, w2, &d2);
-    if (d0.kind == A64_LDR_LIT && d0.rt == 16 && d0.target == fn + 8 &&
-        d1.kind == A64_BR && d1.rn == 16) {
+    /* 形态 B */
+    for (int r = 16; r <= 17; r++) {
+        if (w0 == a64_insn_ldr_lit(r, 1, fn + 8, fn) && w1 == a64_insn_br(r))
+            return 1;
+    }
+    /* 形态 A */
+    if (d0.kind == A64_ADRP && is_ip_reg(d0.rd) && d1.kind == A64_ADD_IMM &&
+        d1.rd == d0.rd && d1.rn == d0.rd && d2.kind == A64_BR &&
+        d2.rn == d0.rd)
+        return 1;
+    /* 形态 C:单条直接跳转(目标离开入口区) */
+    if (d0.kind == A64_B && d0.target != fn && d0.target != fn + 4)
+        return 1;
+    return 0;
+}
+
+/*
+ * 解析入口上现有 hook 的跳转目标(链式共存用):
+ *   - 形态 B:ldr x<reg>, [pc, #8]; br x<reg>; .quad target —— 从运行时读 .quad;
+ *   - 形态 A:adrp x<reg>, page; add x<reg>, x<reg>, #lo12; br x<reg> —— 解码计算;
+ *   - 形态 C:单条 4 字节直接跳转 b <target>(近分支 hook)。
+ * 注意:Dobby 的 TMP_REG_0 = x17(见 Dobby 源码 ARM64_TMP_REG_NDX_0 = 17),
+ * 因此 reg 必须同时接受 x16/x17(IP0/IP1),否则误报"无法识别"。
+ * *patch_len 输出现有 hook 的入口补丁字节数(16/12/4,无法识别为 0):
+ *   链式共存时我方入口补丁不得超过该长度 —— Dobby 的 T_D 会跳回
+ *   fn + patch_len 继续,该处必须是原始指令。
+ * 返回 hook 跳转目标地址;无法识别返回 0。
+ */
+static uint64_t parse_prev_hook(uint64_t fn, int *patch_len) {
+    *patch_len = 0;
+    uint32_t w0, w1, w2;
+    memcpy(&w0, (void *)(uintptr_t)fn, 4);
+    memcpy(&w1, (void *)(uintptr_t)fn + 4, 4);
+    memcpy(&w2, (void *)(uintptr_t)fn + 8, 4);
+    a64_insn_t d0, d1, d2;
+    a64_decode(fn, w0, &d0);
+    a64_decode(fn + 4, w1, &d1);
+    a64_decode(fn + 8, w2, &d2);
+    /* 形态 B(reg ∈ {x16, x17}) */
+    if (d0.kind == A64_LDR_LIT && is_ip_reg(d0.rt) && d0.target == fn + 8 &&
+        d1.kind == A64_BR && d1.rn == d0.rt) {
         uint64_t tgt;
         memcpy(&tgt, (void *)(uintptr_t)fn + 8, 8);
+        *patch_len = 16;
         return tgt;
     }
-    if (d0.kind == A64_ADRP && d0.rd == 16 && d1.kind == A64_ADD_IMM &&
-        d1.rd == 16 && d1.rn == 16 && d2.kind == A64_BR && d2.rn == 16) {
+    /* 形态 A(reg ∈ {x16, x17});Dobby 默认 x17 */
+    if (d0.kind == A64_ADRP && is_ip_reg(d0.rd) && d1.kind == A64_ADD_IMM &&
+        d1.rd == d0.rd && d1.rn == d0.rd && d2.kind == A64_BR &&
+        d2.rn == d0.rd) {
+        *patch_len = 12;
         return d0.page + (uint64_t)d1.imm;
+    }
+    /* 形态 C:单条 4 字节 b <target>(仅当 entry_busy 已确认入口被占用时才有意义) */
+    if (d0.kind == A64_B && d0.target != fn && d0.target != fn + 4) {
+        *patch_len = 4;
+        return d0.target;
     }
     return 0;
 }
@@ -405,9 +522,16 @@ int instr_guard_block(void *fn, void *block_start, void *block_end,
         return INSTR_ERR_ARG;
     }
     elf64_module_t m;
-    uint8_t *img = NULL;
-    size_t imgsz = 0;
-    if (init_module(&m, info.dli_fbase, info.dli_fname, &img, &imgsz) != 0) {
+    /*
+     * 块守卫(非快照)必须读【运行时内存】而非磁盘镜像(与 9ed5149 之前一致):
+     * 磁盘 .so 可能与进程内实际映射不一致(游戏自修改 / 其它 mod 已改字节 /
+     * 提取文件与加载内容不同)。按镜像做参数分析/指令搬移会得到错误的参数
+     * 位置与搬移指令 → 守卫通过路径重放出错指令 → 执行损坏(实测:Player.Update
+     * 上装两处块守卫后进世界整体卡死,回退运行时分析即恢复)。
+     * 镜像读取仅保留给 instr_guard_block_snap 的入口链式共存
+     * (需要原始字节解析 Dobby 入口补丁;其守卫点参数走快照区,不依赖分析)。
+     */
+    if (elf64_module_init(&m, info.dli_fbase, NULL, 0) != 0) {
         set_err("module at %p is not an AArch64 ELF", info.dli_fbase);
         return INSTR_ERR_NOT_ELF;
     }
@@ -420,15 +544,12 @@ int instr_guard_block(void *fn, void *block_start, void *block_end,
         bend <= bstart || bend > (uint64_t)(uintptr_t)m.base + m.size) {
         set_err("block [%p, %p) out of module range base=%p size=0x%zx",
                 block_start, block_end, (void *)m.base, m.size);
-        free(img);
         return INSTR_ERR_RANGE;
     }
 
     uint64_t cend = scan_fn_end(&m, cstart); /* 支持很大的函数 */
-    int rc = apply_plan(&m, cstart, cend, bstart, 0, bend,
-                        (uint64_t)(uintptr_t)check, 0, 0, 0);
-    free(img);
-    return rc;
+    return apply_plan(&m, cstart, cend, bstart, 0, bend,
+                      (uint64_t)(uintptr_t)check, 0, 0, 0, 0, 0);
 }
 
 int instr_guard_block_snap(void *fn, void *block_start, void *block_end,
@@ -463,31 +584,50 @@ int instr_guard_block_snap(void *fn, void *block_start, void *block_end,
         return INSTR_ERR_RANGE;
     }
 
+    /*
+     * 同一函数可装多个块守卫共享一个入口快照:查找本函数上已安装的快照
+     * 记录(入口记录 page_refs==2 且 addr==fn)。命中则复用其快照区,
+     * 仅追加块守卫 —— 入口 trampoline 每次调用保存的 x0~x7 供所有块共享。
+     */
+    uint64_t reuse_snap = 0;
+    for (int i = 0; i < MAX_RECS; i++) {
+        if (g_recs[i].used && g_recs[i].addr == cstart &&
+            g_recs[i].page_refs >= 2) {
+            reuse_snap = (uint64_t)(uintptr_t)g_recs[i].tramp + TRAMP_PAGE +
+                         0x200;
+            break;
+        }
+    }
+    if (reuse_snap != 0) {
+        uint64_t cend = scan_fn_end(&m, cstart);
+        int rc = apply_plan(&m, cstart, cend, bstart, 0, bend,
+                            (uint64_t)(uintptr_t)check, 0, 1, 0, 0,
+                            reuse_snap);
+        free(img);
+        return rc;
+    }
+
     /* 入口占用检测:与 Dobby 等 hook 框架互斥,拒绝静默互相覆盖。
-     * 若入口已被占用且 hook 形态可解析(ldr/br 或 adrp/add/br),则进入
-     * 链式共存:快照 trampoline 保存参数后直接跳进现有 hook 的 trampoline。 */
+     * 若入口已被占用且 hook 形态可解析(形态 A/B/C),则进入链式共存:
+     * 快照 trampoline 保存参数后直接跳进现有 hook。prev_hook_len 记录
+     * 现有 hook 的补丁字节数,链式入口补丁不得超过它(Dobby 的 T_D 会
+     * 跳回 fn+prev_hook_len 继续,该处必须是原始指令)。 */
     uint64_t prev_hook = 0;
+    int prev_hook_len = 0;
     if (entry_busy(&m, cstart)) {
-        prev_hook = parse_prev_hook(cstart);
-        if (prev_hook == 0) {
+        prev_hook = parse_prev_hook(cstart, &prev_hook_len);
+        if (prev_hook == 0 || prev_hook_len == 0) {
             set_err("entry of %p is hooked by an unrecognized framework; "
                     "cannot chain snapshot guard", fn);
             free(img);
             return INSTR_ERR_ENTRY_BUSY;
         }
-        /* 同一函数重复安装快照守卫:入口已是我们自己的补丁,拒绝 */
-        for (int i = 0; i < MAX_RECS; i++) {
-            if (g_recs[i].used && g_recs[i].addr == cstart) {
-                set_err("snapshot guard already installed on %p", fn);
-                free(img);
-                return INSTR_ERR_ENTRY_BUSY;
-            }
-        }
     }
 
     uint64_t cend = scan_fn_end(&m, cstart);
     int rc = apply_plan(&m, cstart, cend, bstart, 0, bend,
-                        (uint64_t)(uintptr_t)check, 0, 1, prev_hook);
+                        (uint64_t)(uintptr_t)check, 0, 1, prev_hook,
+                        prev_hook_len, 0);
     free(img);
     return rc;
 }

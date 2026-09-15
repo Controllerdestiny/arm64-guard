@@ -199,8 +199,16 @@ tools/                     构建与验证脚本(NDK / zig / capstone / unicorn)
   需要"参数一定拿得到"时用入口快照模式(`instr_guard_block_snap`)。
 - 入口快照模式限制:会改写 fn 入口 16 字节(指令级等价);每次调用该函数
   多一次保存/恢复的开销;守卫点到达前若同一函数被递归/自调用重新进入,
-  快照会被内层覆盖(罕见);同一函数只支持安装一个快照守卫。
+  快照会被内层覆盖(罕见)。
+- **同一函数可装多个块守卫共享一个入口快照**:第一次 `instr_guard_block_snap`
+  建立入口快照 + 该块;后续对同一函数的 `instr_guard_block_snap` 自动复用
+  既有快照区,只追加块守卫 —— 多个块(如 Player.Update 的物理块+液体块)
+  都能从入口快照拿到 x0~x7,check 不依赖任何数据流分析。
 - check 与目标代码不要相互递归调用被守卫的函数。
+- **check 是普通 C 函数,可破坏调用者保存的浮点寄存器(d0~d7、d16~d31)**:
+  trampoline 已保存/恢复 d0~d31 —— 守卫的代码块常是浮点重负载(物理/碰撞/
+  液体计算),不恢复 FP 会导致块内计算错乱(NaN)→ 死循环/崩溃。skip 路径
+  不执行块内代码看不出问题,pass 路径(正常执行块)必现。
 - 分析窗口上限 256K 条指令:守卫点距函数入口超过该距离时报 `INSTR_ERR_NOLOC`
   (快照模式不受此限)。
 
@@ -211,10 +219,10 @@ tools/                     构建与验证脚本(NDK / zig / capstone / unicorn)
 | 场景 | 是否可共存 | 说明 |
 |---|---|---|
 | 不同函数:一个用 arm64-guard,另一个用 Dobby | ✅ | 互不影响 |
-| 同一函数:Dobby(hook 入口)+ `instr_guard_block`(数据流,不碰入口) | ✅ | 任意顺序均可 —— 分析器优先读磁盘 .so 镜像(原始指令字节),Dobby 先改入口也不影响参数分析;装好后两者各自占用不同字节 |
-| 同一函数:Dobby + `instr_guard_block_snap` | ✅(需先装 Dobby) | **hook 链共存**:先装 Dobby,再装快照守卫 —— 快照安装前检测到入口已被占用,自动解析现有 hook(形态 A `adrp/add/br` 或形态 B `ldr/br/.quad`)并链式接入:入口先走我们的快照 trampoline 保存 x0~x7,再跳进 Dobby 的 trampoline 正常执行 —— 两条 hook 同时生效,互不覆盖 |
+| 同一函数:Dobby(hook 入口)+ `instr_guard_block`(数据流,不碰入口) | ✅ | **必须 arm64-guard 先装、Dobby 后装**(或保证入口未被改写时安装):块守卫读**运行时内存**分析参数,入口若已被 Dobby 改写为跳转会 NOLOC(与 9ed5149 之前的语义一致)。之所以不用磁盘镜像分析——磁盘 .so 可能与进程内实际映射不一致(游戏自修改/多 mod 共存),按镜像生成的搬移指令/参数位置会出错 → 守卫通过路径执行损坏(实测 Player.Update 双守卫后进世界卡死)。快照模式仍读镜像(入口链式共存需要) |
+| 同一函数:Dobby + `instr_guard_block_snap` | ✅(需先装 Dobby) | **hook 链共存**:先装 Dobby,再装快照守卫 —— 快照安装前检测到入口已被占用,自动解析现有 hook(形态 A `adrp/add/br`、形态 B `ldr/br/.quad`,寄存器 x16/x17 均可;Dobby 的 TMP_REG_0 = x17)并链式接入:入口先走我们的快照 trampoline 保存 x0~x7,再跳进 Dobby 的 trampoline 正常执行 —— 两条 hook 同时生效,互不覆盖。**注意**:Dobby 的重定位代码(T_D)会跳回 `fn + Dobby补丁长度` 继续(形态 A=12B 跳回 fn+12),因此链式入口补丁**不得超过** Dobby 补丁长度(形态 A 用 12B `adrp/add/br`,形态 C 用 4B `b`),否则覆盖 T_D 跳回目标 → 执行补丁数据崩溃 |
 | 同一函数:先装 `instr_guard_block_snap` 再装 Dobby | ⚠️ 不保证 | Dobby 会把我们的入口补丁当作"原始指令"搬进它的 trampoline,行为取决于 Dobby 实现;同一函数建议按"Dobby 先、快照后"的顺序 |
-| 入口被无法识别的 hook 占用(非 ldr/br 或 adrp/add/br 形态) | ❌ | 返回 `INSTR_ERR_ENTRY_BUSY`,拒绝静默覆盖 |
+| 入口被无法识别的 hook 占用(非 ldr/br 或 adrp/add/br 形态,且非单条 `b`) | ❌ | 返回 `INSTR_ERR_ENTRY_BUSY`,拒绝静默覆盖 |
 
 要点:同一函数上**入口只能有一个主人** —— 想 hook 入口用 Dobby(或
 `instr_guard_block_snap`,可链在 Dobby 之后),想在函数内部做条件执行守卫用

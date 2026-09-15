@@ -97,8 +97,8 @@ static int em_put_displaced(em_t *e, uint64_t old_pc, uint32_t insn) {
         em_put(e, a64_insn_br(16));
         return 0;
     case A64_CBZ: {
-        int cbnz = ((insn & 0x7E000000) == 0x35000000 ||
-                    (insn & 0x7E000000) == 0xB5000000);
+        /* cbnz/cbz 由 bit24 区分(掩码 0x7E000000 会清掉 bit24,不可用!) */
+        int cbnz = (insn & 0x01000000) != 0;
         /* cbz rt,target:rt==0 跳。反转:cbnz rt,skip;绝对跳 target;skip: 继续 */
         em_put(e, cbnz ? a64_insn_cbz(d.rt, d.is64, em_here(e) + 6 * 4, em_here(e))
                        : a64_insn_cbnz(d.rt, d.is64, em_here(e) + 6 * 4, em_here(e)));
@@ -107,8 +107,8 @@ static int em_put_displaced(em_t *e, uint64_t old_pc, uint32_t insn) {
         return 0;
     }
     case A64_TBZ: {
-        int tbnz = ((insn & 0x7E000000) == 0x37000000 ||
-                    (insn & 0x7E000000) == 0xB7000000);
+        /* tbnz/tbz 由 bit24 区分(掩码 0x7E000000 会清掉 bit24,不可用!) */
+        int tbnz = (insn & 0x01000000) != 0;
         /* tbz/tbnz rt,#bit,target 超范围(±32KB):反转条件跳到 skip(继续执行),
          * 条件满足时落入绝对跳转序列跳 target。
          * 原 tbz(位==0 跳)→ skip 用 tbnz;原 tbnz(位==1 跳)→ skip 用 tbz。 */
@@ -168,6 +168,27 @@ static uint32_t fetch_module(void *ctx, uint64_t addr) {
     const uint8_t *img = m->image ? m->image : m->base;
     uint32_t w;
     memcpy(&w, img + off, 4);
+    return w;
+}
+
+/*
+ * 读"运行时"内存中的指令(始终从 m->base 取,忽略磁盘镜像)。
+ * 与 fetch_module 的区别:fetch_module 有离线镜像时读镜像(原始字节),
+ * 用于参数分析/搬移 —— 镜像看不到同一函数上先前已安装守卫的补丁;
+ * 而 collect_external_fixups 扫描"谁跳进当前补丁区"必须看运行时实况:
+ *   同一函数先后装多个守卫时,先前守卫的补丁区(adrp/add/br 等)在运行时
+ *   是跳转序列、不是分支指令;若按镜像扫描会把那些位置误判为原始分支
+ *   并改写 → 覆盖先前守卫的补丁,还可能制造回跳死循环(线程卡死)。
+ */
+static uint32_t fetch_live(void *ctx, uint64_t addr) {
+    const elf64_module_t *m = (const elf64_module_t *)ctx;
+    if (!m->base || addr < (uint64_t)(uintptr_t)m->base)
+        return 0;
+    ptrdiff_t off = (ptrdiff_t)(addr - (uint64_t)(uintptr_t)m->base);
+    if (m->size && (size_t)off + 4 > m->size)
+        return 0;
+    uint32_t w;
+    memcpy(&w, (void *)(uintptr_t)m->base + off, 4);
     return w;
 }
 
@@ -286,7 +307,8 @@ static int collect_external_fixups(const elf64_module_t *m,
         /* 补丁区本身会被整体改写,跳过 */
         if (pc >= guard_pc && pc < guard_pc + (uint64_t)plen)
             continue;
-        uint32_t insn = fetch_module((void *)m, pc);
+        /* 必须扫运行时实况(镜像看不到先前守卫的补丁,会误改 → 死循环) */
+        uint32_t insn = fetch_live((void *)m, pc);
         a64_insn_t d;
         a64_decode(pc, insn, &d);
 
@@ -317,15 +339,15 @@ static int collect_external_fixups(const elf64_module_t *m,
             new_insn = a64_insn_b_cond(guard_pc, pc, (int)(insn & 15));
             break;
         case A64_CBZ: {
-            int cbnz = ((insn & 0x7E000000) == 0x35000000 ||
-                        (insn & 0x7E000000) == 0xB5000000);
+            /* cbnz/cbz 由 bit24 区分(掩码 0x7E000000 会清掉 bit24,不可用!) */
+            int cbnz = (insn & 0x01000000) != 0;
             new_insn = cbnz ? a64_insn_cbnz(d.rt, d.is64, guard_pc, pc)
                             : a64_insn_cbz(d.rt, d.is64, guard_pc, pc);
             break;
         }
         case A64_TBZ: {
-            int tbnz = ((insn & 0x7E000000) == 0x37000000 ||
-                        (insn & 0x7E000000) == 0xB7000000);
+            /* tbnz/tbz 由 bit24 区分(掩码 0x7E000000 会清掉 bit24,不可用!) */
+            int tbnz = (insn & 0x01000000) != 0;
             new_insn = a64_insn_tbz(d.rt, (int)d.imm, d.is64, guard_pc, pc);
             if (tbnz)
                 new_insn ^= 0x01000000u;
@@ -350,18 +372,30 @@ static int collect_external_fixups(const elf64_module_t *m,
 /* ---------------- 保存/恢复序列 ---------------- */
 
 /*
- * 全寄存器上下文保存:压栈 x0..x29、x30、NZCV,再开辟 64 字节 scratch 区。
- * 布局(sp 下降 TRAMP_SAVE_BYTES):
- *   [sp+0 ..  sp+56 )  8×8B scratch(参数恢复暂存)
- *   [sp+64 .. sp+80 )  NZCV
- *   [sp+80 .. sp+96 )  x30,xzr
- *   [sp+96 .. sp+336)  x0..x29
- * 目的:check 调用 / 参数恢复可以任意改写任何寄存器,被搬移指令重放前
- * 恢复完整现场 → 重放指令读到的寄存器与守卫点完全一致(消除暂存污染)。
+ * 全寄存器上下文保存:压栈 d0..d31、x0..x29、x30、NZCV,再开辟 64 字节
+ * scratch 区。
+ * 布局(sp 下降 TRAMP_SAVE_BYTES,低地址 → 高地址):
+ *   [sp+0   .. sp+64  ) 8×8B scratch(参数恢复暂存)
+ *   [sp+64  .. sp+80  ) NZCV
+ *   [sp+80  .. sp+96  ) x30,xzr
+ *   [sp+96  .. sp+336 ) x0..x29
+ *   [sp+336 .. sp+592 ) d0..d31
+ * 目的:check 调用 / 参数恢复可以任意改写任何寄存器(包括 FP/SIMD!),
+ * 被搬移指令重放前恢复完整现场 → 重放指令读到的寄存器与守卫点完全一致。
+ *
+ * 【必须保存 d0~d31】check 是普通 C 函数,按 AAPCS64 可随意破坏 d0~d7 与
+ * d16~d31(调用者保存);而守卫的代码块常是浮点重负载(物理/碰撞/液体计算,
+ * 如 Player.Update 物理块内 ldp s14,s0 等)。不保存 FP 寄存器 → check 污染
+ * 浮点寄存器 → 块内物理计算错乱(NaN)→ 游戏逻辑死循环。skip 路径不执行
+ * 块内代码所以看不出问题,pass 路径(正常执行块)必然崩溃/卡死。
  */
-#define TRAMP_SAVE_BYTES  336   /* 16*16 + 16(nzcv) + 64(scratch) */
+#define TRAMP_SAVE_BYTES  592   /* 256(d0-d31) + 240(x0-x29) + 16(x30) + 16(nzcv) + 64(scratch) */
 
 static void emit_save_all(em_t *e) {
+    /* d0..d31:16 个 stp d 对(64 位对存编码与 x 相同) */
+    for (int i = 0; i < 32; i += 2)
+        em_put(e, a64_insn_stp_pre(i, i + 1, 31, -16, 1));
+    /* x0..x29(15 对)+ x30,xzr */
     em_put(e, a64_insn_stp_pre(0, 1, 31, -16, 1));
     em_put(e, a64_insn_stp_pre(2, 3, 31, -16, 1));
     em_put(e, a64_insn_stp_pre(4, 5, 31, -16, 1));
@@ -403,6 +437,9 @@ static void emit_restore_all(em_t *e) {
     em_put(e, a64_insn_ldp_post(4, 5, 31, 16, 1));
     em_put(e, a64_insn_ldp_post(2, 3, 31, 16, 1));
     em_put(e, a64_insn_ldp_post(0, 1, 31, 16, 1));
+    /* d0..d31(后进先出,与 save 顺序相反) */
+    for (int i = 30; i >= 0; i -= 2)
+        em_put(e, a64_insn_ldp_post(i, i + 1, 31, 16, 1));
 }
 
 /*
@@ -431,6 +468,43 @@ static void em_addr(em_t *e, int base, int64_t off) {
 static void em_slot_load(em_t *e, int dst, int base, int64_t off, int is64) {
     em_addr(e, base, off);
     em_put(e, a64_insn_ldr_imm(dst, 16, 0, is64));
+}
+
+/*
+ * 发射"恢复入口参数到 x0~x7"(供主路径与补丁区内回跳重入序列共用):
+ *   - 快照模式:从入口快照区直接加载(x0~x7 在函数入口被原样保存);
+ *   - 数据流模式:REG 源先存栈 scratch、SLOT 源加载到 x(8+k)、统一组装。
+ * 必须在 emit_save_all 之后调用(scratch 区与寄存器现场已就绪)。
+ */
+static void emit_args_load(em_t *e, uint64_t snap_addr, const a64_loc_t *locs) {
+    if (snap_addr != 0) {
+        em_put_lit(e, 9, snap_addr);
+        for (int k = 0; k < ANALYSIS_NARGS; k++)
+            em_put(e, a64_insn_ldr_imm(k, 9, 8 * k, 1));
+    } else {
+        for (int k = 0; k < ANALYSIS_NARGS; k++) {
+            if (locs[k].kind == LOC_REG && locs[k].reg != k)
+                em_put(e, a64_insn_str_imm(locs[k].reg, 31, 8 * k, 1));
+        }
+        for (int k = 0; k < ANALYSIS_NARGS; k++) {
+            if (locs[k].kind == LOC_SLOT) {
+                int64_t off = locs[k].off;
+                if (locs[k].base_reg == 31)
+                    off += TRAMP_SAVE_BYTES;
+                em_slot_load(e, 8 + k, locs[k].base_reg, off, locs[k].is64);
+            }
+        }
+        for (int k = 0; k < ANALYSIS_NARGS; k++) {
+            if (locs[k].kind == LOC_REG) {
+                if (locs[k].reg != k)
+                    em_put(e, a64_insn_ldr_imm(k, 31, 8 * k, 1));
+            } else if (locs[k].kind == LOC_SLOT) {
+                em_put(e, a64_insn_mov_reg(k, 8 + k, 1));
+            } else {
+                em_put(e, a64_insn_mov_reg(k, 31, 1)); /* mov xk, xzr */
+            }
+        }
+    }
 }
 
 /* ---------------- 规划主流程 ---------------- */
@@ -519,34 +593,7 @@ int instr_plan_guard(const elf64_module_t *m,
      *       与任意偏移(sp 槽位偏移已含 TRAMP_SAVE_BYTES 校正);
      *       最后统一组装 x0..x7。
      */
-    if (snap_addr != 0) {
-        em_put_lit(&e, 9, snap_addr);
-        for (int k = 0; k < ANALYSIS_NARGS; k++)
-            em_put(&e, a64_insn_ldr_imm(k, 9, 8 * k, 1));
-    } else {
-        for (int k = 0; k < ANALYSIS_NARGS; k++) {
-            if (locs[k].kind == LOC_REG && locs[k].reg != k)
-                em_put(&e, a64_insn_str_imm(locs[k].reg, 31, 8 * k, 1));
-        }
-        for (int k = 0; k < ANALYSIS_NARGS; k++) {
-            if (locs[k].kind == LOC_SLOT) {
-                int64_t off = locs[k].off;
-                if (locs[k].base_reg == 31)
-                    off += TRAMP_SAVE_BYTES;
-                em_slot_load(&e, 8 + k, locs[k].base_reg, off, locs[k].is64);
-            }
-        }
-        for (int k = 0; k < ANALYSIS_NARGS; k++) {
-            if (locs[k].kind == LOC_REG) {
-                if (locs[k].reg != k)
-                    em_put(&e, a64_insn_ldr_imm(k, 31, 8 * k, 1));
-            } else if (locs[k].kind == LOC_SLOT) {
-                em_put(&e, a64_insn_mov_reg(k, 8 + k, 1));
-            } else {
-                em_put(&e, a64_insn_mov_reg(k, 31, 1)); /* mov xk, xzr */
-            }
-        }
-    }
+    emit_args_load(&e, snap_addr, locs);
 
     /* 3c. mycheck(入口参数...) */
     em_put_lit(&e, 17, check_addr);
@@ -678,7 +725,8 @@ int instr_plan_guard(const elf64_module_t *m,
 int instr_plan_entry_snapshot(const elf64_module_t *m,
                               uint64_t fn, uint64_t block_end,
                               uint64_t snap_addr, uint64_t entry_tramp_base,
-                              uint64_t prev_hook, instr_plan_t *out) {
+                              uint64_t prev_hook, int prev_hook_len,
+                              instr_plan_t *out) {
     if (!m || !out || (fn & 3))
         return INSTR_ERR_ARG;
 
@@ -736,21 +784,53 @@ int instr_plan_entry_snapshot(const elf64_module_t *m,
         return INSTR_ERR_OTHER;
     out->tramp_words = e.n;
 
-    /* 外部指向入口补丁区的分支重映射(循环回跳等) */
-    {
-        int rc = collect_external_fixups(m, fn, 0, block_end, fn, 16, out);
-        if (rc != INSTR_OK)
-            return rc;
-    }
-
-    /* 入口补丁:形态 B,固定 16 字节 */
-    {
+    /*
+     * 入口补丁:长度必须 ≤ 现有 hook 的补丁长度(链式共存时)。
+     * Dobby 形态 A(12B) 的 T_D 会跳回 fn+12、形态 C(4B) 跳回 fn+4 继续
+     * 执行,该处必须是原始指令 —— 若被我们的补丁数据覆盖,执行到那里
+     * 就是垃圾字节 → 崩溃。因此:
+     *   prev_hook_len >= 16:16B 形态 B(ldr/br/.quad,无距离限制);
+     *   prev_hook_len >= 12:优先 12B 形态 A(adrp/add/br,±4GB 可达);
+     *   prev_hook_len >= 4 :退 4B 直接 b(±128MB 可达);
+     *   均不可达 → 报错(调用方回退,不崩)。
+     */
+    if (prev_hook != 0 && prev_hook_len > 0 && prev_hook_len < 16) {
+        uint32_t adrp12 = a64_insn_adrp(16, entry_tramp_base, fn);
+        if (prev_hook_len >= 12 && adrp12) {
+            uint32_t p0 = adrp12;
+            uint32_t p1 = a64_insn_add_imm(
+                16, 16, (uint16_t)(entry_tramp_base & 0xFFF), 1);
+            uint32_t p2 = a64_insn_br(16);
+            memcpy(out->patch + 0, &p0, 4);
+            memcpy(out->patch + 4, &p1, 4);
+            memcpy(out->patch + 8, &p2, 4);
+            out->patch_len = 12;
+        } else {
+            uint32_t b4 = a64_insn_b(entry_tramp_base, fn);
+            if (prev_hook_len >= 4 && b4) {
+                memcpy(out->patch + 0, &b4, 4);
+                out->patch_len = 4;
+            } else {
+                /* 无法在保留 fn[prev_hook_len..16) 原始指令的前提下接入 */
+                return INSTR_ERR_OTHER;
+            }
+        }
+    } else {
+        /* 非链式 / 现有 hook 为形态 B(16B):16B 形态 B,无距离限制 */
         uint32_t p0 = a64_insn_ldr_lit(16, 1, fn + 8, fn);
         uint32_t p1 = a64_insn_br(16);
         memcpy(out->patch + 0, &p0, 4);
         memcpy(out->patch + 4, &p1, 4);
         memcpy(out->patch + 8, &entry_tramp_base, 8);
+        out->patch_len = 16;
     }
-    out->patch_len = 16;
+
+    /* 外部指向入口补丁区的分支重映射(循环回跳等),范围按实际补丁长度 */
+    {
+        int rc = collect_external_fixups(m, fn, 0, block_end, fn,
+                                         out->patch_len, out);
+        if (rc != INSTR_OK)
+            return rc;
+    }
     return INSTR_OK;
 }

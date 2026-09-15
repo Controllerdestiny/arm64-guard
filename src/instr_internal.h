@@ -22,7 +22,7 @@ extern "C" {
 
 #define INSTR_PATCH_LEN   12   /* 形态 A 补丁长度                          */
 #define INSTR_PATCH_MAX   16   /* 形态 B 补丁长度(缓冲上限)                */
-#define INSTR_TRAMP_MAX   256  /* trampoline 最大指令字(含字面量池)        */
+#define INSTR_TRAMP_MAX   512  /* trampoline 最大指令字(含字面量池/重入序列)*/
 #define INSTR_FIX_MAX     64   /* 外部回跳补丁区的分支重映射上限            */
 
 /* 外部分支修复项:函数内某条分支的目标原本落在补丁区内,将其目标重映射。 */
@@ -76,7 +76,7 @@ int instr_plan_guard(const elf64_module_t *m,
 
 /*
  * 规划函数入口的"参数快照"补丁(入口快照模式):
- *   fn 入口被改写为 16 字节跳转到 entry_tramp_base 处的入口 trampoline,
+ *   fn 入口被改写为跳转到 entry_tramp_base 处的入口 trampoline,
  *   入口 trampoline 把 x0~x7 保存到 snap_addr,重放入口被覆盖的指令,
  *   再跳回 fn+16。之后任何守卫点都能从 snap_addr 读到入口参数(100% 可恢复,
  *   与函数内部复杂度无关,类似 dobby 的入口 hook)。
@@ -85,12 +85,19 @@ int instr_plan_guard(const elf64_module_t *m,
  * 占用,入口 trampoline 保存完 x0~x7 后直接跳到 prev_hook(现有 hook 的
  * trampoline 地址),由它继续重放原始指令 —— 快照 hook 与 Dobby 同时生效。
  *
+ * 【关键约束】prev_hook_len 是现有 hook 的入口补丁字节数(形态 B=16,
+ * 形态 A=12,形态 C=4)。Dobby 的重定位代码(T_D)执行完搬移指令后会跳回
+ * fn + prev_hook_len,指望该处仍是原始指令 —— 因此链式共存时我们的入口
+ * 补丁【不得超过】prev_hook_len(否则覆盖 T_D 的跳回目标 → 执行补丁数据
+ * 崩溃)。函数内按可达性选择 12B 形态 A / 4B 直接 b;均不可达报错。
+ *
  * block_end 用于外部回跳修复的扫描范围。返回 0 成功。
  */
 int instr_plan_entry_snapshot(const elf64_module_t *m,
                               uint64_t fn, uint64_t block_end,
                               uint64_t snap_addr, uint64_t entry_tramp_base,
-                              uint64_t prev_hook, instr_plan_t *out);
+                              uint64_t prev_hook, int prev_hook_len,
+                              instr_plan_t *out);
 
 #ifdef __cplusplus
 }
